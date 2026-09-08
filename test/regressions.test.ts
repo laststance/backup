@@ -17,6 +17,76 @@ import { scanSource } from '../src/filetree'
 
 useFixtures()
 
+test('preserves commit recovery instructions when lock cleanup also fails', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.source, 'foo.md'), 'retained payload\n')
+  const hook = join(world.repo, '.git', 'hooks', 'pre-commit')
+  await put(
+    hook,
+    '#!/bin/sh\nrm -f "$(git rev-parse --git-common-dir)/laststance-backup.lock/owner.json"\nexit 1\n',
+  )
+  await chmod(hook, 0o755)
+  // Act
+  const result = world.cli(['--repo', world.repo, 'foo.md'])
+  // Assert
+  await expect(result).rejects.toThrow('Backup failed during committing')
+  await expect(result).rejects.toThrow('repair or commit the changes manually')
+  await expect(result).rejects.toThrow('Lock cleanup failed')
+  expect(await readFile(join(world.repo, 'foo.md'), 'utf8')).toBe(
+    'retained payload\n',
+  )
+})
+
+test('reports lock cleanup failure even after a successful push', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.source, 'foo.md'), 'pushed payload\n')
+  const hook = join(world.repo, '.git', 'hooks', 'pre-commit')
+  await put(
+    hook,
+    '#!/bin/sh\nrm -f "$(git rev-parse --git-common-dir)/laststance-backup.lock/owner.json"\nexit 0\n',
+  )
+  await chmod(hook, 0o755)
+  // Act / Assert
+  await expect(world.cli(['--repo', world.repo, 'foo.md'])).rejects.toThrow(
+    'owner.json',
+  )
+  expect((await world.git(['show', 'main:foo.md'], world.remote)).stdout).toBe(
+    'pushed payload\n',
+  )
+  expect(
+    (
+      await lstat(join(world.repo, '.git', 'laststance-backup.lock'))
+    ).isDirectory(),
+  ).toBe(true)
+})
+
+test('keeps fixture Git objects isolated from inherited object-directory settings', async () => {
+  // Arrange
+  const world = await createWorld()
+  const redirectedObjects = join(world.root, 'redirected-objects')
+  const previous = process.env.GIT_OBJECT_DIRECTORY
+  process.env.GIT_OBJECT_DIRECTORY = redirectedObjects
+  try {
+    // Act
+    const isolated = await createWorld()
+    await put(join(isolated.repo, 'foo.md'), 'isolated payload\n')
+    await isolated.commit()
+    // Assert
+    expect((await isolated.git(['show', 'HEAD:foo.md'])).stdout).toBe(
+      'isolated payload\n',
+    )
+    expect(
+      await lstat(redirectedObjects).catch(() => undefined),
+    ).toBeUndefined()
+  } finally {
+    // Restore the caller's environment even when fixture creation fails.
+    if (previous === undefined) delete process.env.GIT_OBJECT_DIRECTORY
+    else process.env.GIT_OBJECT_DIRECTORY = previous
+  }
+})
+
 test('preserves tracked executable modes and adds normal files when Git ignores filesystem modes', async () => {
   // Arrange
   const world = await createWorld()
@@ -132,13 +202,14 @@ test.skipIf(process.platform === 'win32')(
         await lstat(join(world.root, 'survived')).catch(() => undefined),
       ).toBeUndefined()
     } finally {
-      const group = Number(
-        await readFile(join(world.root, 'process-group'), 'utf8'),
-      )
       try {
-        process.kill(-group, 'SIGKILL')
+        const group = Number(
+          await readFile(join(world.root, 'process-group'), 'utf8'),
+        )
+        if (Number.isInteger(group) && group > 0)
+          process.kill(-group, 'SIGKILL')
       } catch {
-        /* The tested cleanup already reaped the group. */
+        /* Startup may not have written the marker, or tested cleanup already reaped the group. */
       }
     }
   },

@@ -102,7 +102,7 @@ export async function createWorld() {
   // Isolate tests from repository and authentication variables inherited from the developer's shell.
   for (const key of Object.keys(env)) {
     if (
-      /^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|CONFIG_COUNT|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)$/.test(
+      /^GIT_(DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG|CONFIG_PARAMETERS|CONFIG_COUNT|CONFIG_KEY_\d+|CONFIG_VALUE_\d+|NAMESPACE|SHALLOW_FILE|REPLACE_REF_BASE|LITERAL_PATHSPECS|GLOB_PATHSPECS|NOGLOB_PATHSPECS|ICASE_PATHSPECS)$/.test(
         key,
       ) ||
       /^(GH|GITHUB)_TOKEN$/.test(key) ||

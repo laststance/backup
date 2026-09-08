@@ -113,6 +113,7 @@ export async function backup(
   const release = await acquireLock(repository)
   let phase = 'validation'
   let affectedPath = ''
+  let failure: Error | undefined
   try {
     let config = options.directory ? undefined : options.config
     if (!config) {
@@ -227,10 +228,18 @@ export async function backup(
       : ['push validation', 'pushing'].includes(phase)
         ? `\nLocal commits are retained in ${JSON.stringify(repository.directory)}. Push completion is unconfirmed. Fix the reported issue and rerun the same command; it fetches first and pushes all remaining commits without duplicating the backup commit.`
         : ''
-    throw new Error(`Backup failed during ${phase}: ${detail}${recovery}`, {
+    failure = new Error(`Backup failed during ${phase}: ${detail}${recovery}`, {
       cause: error,
     })
+    throw failure
   } finally {
-    await release()
+    try {
+      await release()
+    } catch (error) {
+      // Preserve phase/recovery details on failure; a cleanup-only failure still makes a successful run fail.
+      if (!failure) throw error
+      const detail = error instanceof Error ? error.message : String(error)
+      failure.message += `\nLock cleanup failed: ${detail}`
+    }
   }
 }
