@@ -319,8 +319,11 @@ test('restores symlink target text without following relative or dangling links'
     (await lstat(join(restored, 'notes', 'dangling'))).isSymbolicLink(),
   ).toBe(true)
   expect(await readlink(join(restored, 'notes', 'dangling'))).toBe(
-    '../missing.md',
+    process.platform === 'win32' ? '..\\missing.md' : '../missing.md',
   )
+  expect(
+    (await world.git(['show', 'main:notes/dangling'], world.remote)).stdout,
+  ).toBe('../missing.md')
   expect(await readlink(join(restored, 'notes', 'relative'))).toBe('file.md')
 })
 

@@ -88,8 +88,16 @@ async function readEntry(
   if (stats.isSymbolicLink()) {
     const target = await readlink(path, { encoding: 'buffer' })
     // Reject undecodable link text instead of silently changing its bytes during copy.
-    new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(target)
-    hash.update(`blob ${target.length}\0`).update(target)
+    const targetText = new TextDecoder('utf-8', {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(target)
+    // Git for Windows stores native link separators as '/', then restores native separators on checkout.
+    const gitTarget =
+      process.platform === 'win32'
+        ? Buffer.from(targetText.replaceAll('\\', '/'))
+        : target
+    hash.update(`blob ${gitTarget.length}\0`).update(gitTarget)
     mode = '120000'
     kind = 'symlink'
   } else {

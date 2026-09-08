@@ -60,12 +60,30 @@ test('repeats and updates dangling symlink backups without following targets', a
   // Assert
   expect(unchanged.stdout).toContain('Unchanged')
   expect(await readlink(join(world.repo, 'dangling'))).toBe(
-    '../different-missing',
+    process.platform === 'win32'
+      ? '..\\different-missing'
+      : '../different-missing',
   )
   expect(
     (await world.git(['show', 'main:dangling'], world.remote)).stdout,
   ).toBe('../different-missing')
 })
+
+test.skipIf(process.platform === 'win32')(
+  'preserves literal backslashes in Unix symlink targets',
+  async () => {
+    // Arrange
+    const world = await createWorld()
+    await symlink('literal\\target', join(world.source, 'link'))
+    // Act
+    await world.cli(['--repo', world.repo, 'link'])
+    // Assert
+    expect((await world.git(['show', 'main:link'], world.remote)).stdout).toBe(
+      'literal\\target',
+    )
+    expect(await readlink(join(world.repo, 'link'))).toBe('literal\\target')
+  },
+)
 
 test('retains unrelated ignored files when an incoming fast-forward would overwrite them', async () => {
   // Arrange

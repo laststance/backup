@@ -98,7 +98,9 @@ test('installs the npm tarball and recovers exact files and links using Node wit
   expect((await lstat(join(restored, 'notes', 'link'))).isSymbolicLink()).toBe(
     true,
   )
-  expect(await readlink(join(restored, 'notes', 'link'))).toBe('../missing.md')
+  expect(await readlink(join(restored, 'notes', 'link'))).toBe(
+    process.platform === 'win32' ? '..\\missing.md' : '../missing.md',
+  )
   if (process.platform !== 'win32')
     expect((await lstat(join(restored, 'notes', 'run.sh'))).mode & 0o111).toBe(
       0o111,
