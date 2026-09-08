@@ -1,0 +1,12 @@
+export const CONFIG_VERSION = 1
+export const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
+export const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024
+export const COMMAND_TIMEOUT_MS = 120_000
+export const COMMAND_KILL_GRACE_MS = 1_000
+export const PRIVATE_DIRECTORY_MODE = 0o700
+export const PRIVATE_FILE_MODE = 0o600
+export const EXECUTABLE_MODE_MASK = 0o111
+export const MIN_GIT_MAJOR_VERSION = 2
+export const MIN_GIT_MINOR_VERSION = 31
+export const INTERRUPTED_EXIT_CODE = 130
+export const TERMINATED_EXIT_CODE = 143
