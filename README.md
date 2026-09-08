@@ -8,7 +8,7 @@ backup foo.md
 
 ## Install and register
 
-Requires Node.js 24+, Git 2.31+, and the [GitHub CLI](https://cli.github.com/). Bun is needed only for development.
+Requires Node.js 24+, Git 2.31+, and the [GitHub CLI](https://cli.github.com/). Development uses Bun 1.4.0.
 
 ```sh
 npm install --global @laststance/backup
@@ -31,6 +31,8 @@ backup -- -draft.md
 ```
 
 One destination is saved in `~/.config/laststance-backup/config.json`: its canonical local path, branch, GitHub repository ID, and name. No credentials are stored. Register again with `--repo` to change it. Source paths are supplied on each invocation.
+
+Show usage with `backup --help` (`-h`) or the installed version with `backup --version` (`-v`).
 
 ## Copy and push behavior
 
@@ -89,7 +91,7 @@ bun run dev -- --help
 npm pack
 ```
 
-Bun builds TypeScript into one Node ESM CLI with no npm runtime dependencies. `prepack` builds the distributable. `bun run check` runs type checking, build, real-Git behavior tests, and an isolated npm tarball installation/Node/recovery test. macOS, Linux, and Windows run the same suite in CI; POSIX signal, permission, and terminal tests are Unix-only. Terminal tests use Python 3's standard-library PTY module on Unix. The large-tree test covers 10,000 paths totaling over 2 MiB, and streamed output is tested with a slow consumer.
+Bun builds TypeScript into one Node ESM CLI with no npm runtime dependencies. `prepack` builds the distributable. `bun run check` runs type checking, build, real-Git behavior tests, and an isolated npm tarball installation/Node/recovery test. CI is configured to run the same suite on macOS, Linux, and Windows; POSIX signal, permission, and terminal tests are Unix-only. Terminal tests use Python 3's standard-library PTY module on Unix. The large-tree test covers 10,000 paths totaling over 2 MiB, and streamed output is tested with a slow consumer.
 
 ## Release
 
@@ -105,7 +107,7 @@ npm view @laststance/backup version
 
 Use the tarball matching the package version. `npm publish` can require interactive authentication/2FA; a successful login alone does not prove publication.
 
-Subsequent releases use `.github/workflows/release.yml`: update the package version and changelog, merge verified changes, configure npm's trusted publisher for GitHub owner `laststance`, repository `backup`, workflow `release.yml`, and allowed action **publish**, then push a matching `v<package-version>` tag. The workflow verifies the tag, tests on all three operating systems, and publishes using OIDC. A manual workflow run only validates the current version unless it runs on its matching tag.
+Subsequent releases use `.github/workflows/release.yml`: update the package version and [changelog](CHANGELOG.md), merge verified changes, configure npm's trusted publisher for GitHub owner `laststance`, repository `backup`, workflow `release.yml`, and allowed action **publish**, then push a matching `v<package-version>` tag. The workflow verifies the tag, tests on all three operating systems, and publishes using OIDC. A manual workflow run only validates the current version unless it runs on its matching tag.
 
 GitHub merge, npm trusted-publisher setup, tagging, and registry publication are separate steps. The workflow cannot create the initial npm package or configure npm account access. See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) for the current account setup and CLI requirements.
 
