@@ -1,6 +1,6 @@
 import { MAX_COMMAND_OUTPUT_BYTES } from '../constants'
 
-/** Decodes Git's streamed NUL records for {@link assertIndexMatches} without splitting unusual filenames.
+/** Decodes Git's streamed NUL records for {@link stageSource} without splitting unusual filenames.
  * @param chunks - Raw subprocess output.
  * @returns Complete UTF-8 records in order.
  * @example for await (const path of readNulRecords(stream)) console.log(path);
