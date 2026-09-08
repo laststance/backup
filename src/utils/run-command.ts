@@ -40,34 +40,43 @@ export async function runCommand(
   let failure: Error | undefined
   let output = ''
   let diagnostic = Buffer.alloc(0)
-  let killTimer: ReturnType<typeof setTimeout> | undefined
+  let shutdown: Promise<void> | undefined
 
   // Stop the process group on Unix so Git's transport children cannot hold pipes open.
   const stop = () => {
+    if (shutdown) return
     if (child.pid && process.platform !== 'win32') {
       try {
         process.kill(-child.pid, 'SIGTERM')
       } catch {
         /* The process may already have exited. */
       }
-    } else {
-      child.kill('SIGTERM')
+    } else if (child.pid) {
+      // Windows has no Unix process groups; terminate Git and transport/helper descendants together.
+      const killer = spawn(
+        'taskkill',
+        ['/PID', String(child.pid), '/T', '/F'],
+        { stdio: 'ignore', windowsHide: true },
+      )
+      killer.once('error', () => child.kill('SIGKILL'))
     }
-    killTimer ??= setTimeout(() => {
-      if (child.pid && process.platform !== 'win32') {
-        try {
-          process.kill(-child.pid, 'SIGKILL')
-        } catch {
-          /* Already exited. */
+    shutdown = new Promise<void>((resolve) =>
+      setTimeout(() => {
+        if (child.pid && process.platform !== 'win32') {
+          try {
+            process.kill(-child.pid, 'SIGKILL')
+          } catch {
+            /* Already exited. */
+          }
+        } else {
+          child.kill('SIGKILL')
         }
-      } else {
-        child.kill('SIGKILL')
-      }
-      child.stdout.destroy()
-      child.stderr.destroy()
-      child.stdin.destroy()
-    }, COMMAND_KILL_GRACE_MS)
-    killTimer.unref()
+        child.stdout.destroy()
+        child.stderr.destroy()
+        child.stdin.destroy()
+        resolve()
+      }, COMMAND_KILL_GRACE_MS),
+    )
   }
   const abort = () => {
     failure = new Error('Backup cancelled.')
@@ -114,7 +123,10 @@ export async function runCommand(
         -MAX_COMMAND_OUTPUT_BYTES,
       )
     }
-  })()
+  })().catch((error: unknown) => {
+    failure ??= error instanceof Error ? error : new Error(String(error))
+    stop()
+  })
   const inputTask = options.input
     ? pipeline(Readable.from(options.input), child.stdin).catch(
         (error: unknown) => error,
@@ -138,7 +150,8 @@ export async function runCommand(
     return { exitCode, stdout: output }
   } finally {
     clearTimeout(timeout)
-    if (killTimer) clearTimeout(killTimer)
     options.signal?.removeEventListener('abort', abort)
+    // Wait through the grace period even if the immediate child exited; detached-I/O descendants may remain.
+    await shutdown
   }
 }

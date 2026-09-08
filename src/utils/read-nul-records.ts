@@ -15,7 +15,7 @@ export async function* readNulRecords(
     let end = data.indexOf(0, start)
     // Decode only complete records; UTF-8 characters may cross stream chunks.
     while (end !== -1) {
-      yield new TextDecoder('utf-8', { fatal: true }).decode(
+      yield new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
         data.subarray(start, end),
       )
       start = end + 1

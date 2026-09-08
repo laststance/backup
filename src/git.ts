@@ -424,6 +424,7 @@ export async function synchronize(
       'merge',
       '--quiet',
       '--ff-only',
+      '--no-overwrite-ignore',
       '--no-edit',
       trackingRef,
     ],

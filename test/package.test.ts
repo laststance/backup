@@ -8,6 +8,7 @@ import {
   symlink,
 } from 'node:fs/promises'
 import { join } from 'node:path'
+import { version } from '../package.json'
 import {
   createWorld,
   npm,
@@ -35,7 +36,7 @@ test('installs the npm tarball and recovers exact files and links using Node wit
       '--ignore-scripts',
       '--no-audit',
       '--no-fund',
-      join(packed, 'laststance-backup-0.1.0.tgz'),
+      join(packed, `laststance-backup-${version}.tgz`),
     ],
     consumer,
     world.env,
@@ -57,10 +58,37 @@ test('installs the npm tarball and recovers exact files and links using Node wit
   await symlink('../missing.md', join(world.source, 'notes', 'link'))
 
   // Act
-  await world.cli(['--repo', world.repo, 'notes'], {}, entry)
+  await npm(
+    [
+      'exec',
+      '--offline',
+      '--',
+      'backup',
+      '--repo',
+      world.repo,
+      join(world.source, 'notes'),
+    ],
+    consumer,
+    world.env,
+  )
+  const help = await npm(
+    ['exec', '--offline', '--', 'backup', '--help'],
+    consumer,
+    world.env,
+  )
+  const reportedVersion = await npm(
+    ['exec', '--offline', '--', 'backup', '--version'],
+    consumer,
+    world.env,
+  )
   const restored = await recover(world)
 
   // Assert
+  expect(help.stdout).toContain('Usage: backup')
+  expect(reportedVersion.stdout.trim()).toBe(version)
+  expect(
+    await lstat(join(world.root, 'bun-called')).catch(() => undefined),
+  ).toBeUndefined()
   expect([...(await readFile(join(restored, 'notes', 'binary.dat')))]).toEqual([
     0, 255, 13, 10, 128,
   ])

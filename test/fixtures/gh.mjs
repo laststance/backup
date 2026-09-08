@@ -6,6 +6,13 @@ if (process.env.BACKUP_TEST_GH_ERROR) {
   console.error('GitHub API denied (fixture)')
   process.exit(1)
 }
+if (
+  process.env.BACKUP_TEST_METADATA &&
+  !endpoint?.endsWith('/actions/permissions')
+) {
+  console.log(process.env.BACKUP_TEST_METADATA)
+  process.exit(0)
+}
 if (endpoint?.endsWith('/actions/permissions')) {
   const counter = process.env.BACKUP_TEST_GH_COUNTER
   const count =

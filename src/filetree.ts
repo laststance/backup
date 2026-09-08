@@ -1,6 +1,14 @@
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { cp, lstat, mkdir, readdir, readlink, realpath } from 'node:fs/promises'
+import {
+  cp,
+  lstat,
+  mkdir,
+  readdir,
+  readlink,
+  realpath,
+  unlink,
+} from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import type { BigIntStats } from 'node:fs'
 import type { Repository } from './git'
@@ -80,7 +88,7 @@ async function readEntry(
   if (stats.isSymbolicLink()) {
     const target = await readlink(path, { encoding: 'buffer' })
     // Reject undecodable link text instead of silently changing its bytes during copy.
-    new TextDecoder('utf-8', { fatal: true }).decode(target)
+    new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(target)
     hash.update(`blob ${target.length}\0`).update(target)
     mode = '120000'
     kind = 'symlink'
@@ -142,9 +150,10 @@ export async function scanSource(
       encoding: 'buffer',
       withFileTypes: true,
     })) {
-      const childName = new TextDecoder('utf-8', { fatal: true }).decode(
-        child.name,
-      )
+      const childName = new TextDecoder('utf-8', {
+        fatal: true,
+        ignoreBOM: true,
+      }).decode(child.name)
       // Ordinary .git is excluded; aliases reject the entire operation before any copy.
       if (childName === '.git') continue
       if (metadataAlias(childName))
@@ -290,6 +299,8 @@ export async function copySource(
     if (entry.kind === 'directory') {
       await mkdir(destination, { recursive: true })
     } else {
+      // Remove an existing link first: fs.cp otherwise stats dangling link targets on repeated copies.
+      if (entry.kind === 'symlink' && existing) await unlink(destination)
       // fs.cp unlinks replaced files, preserving external hardlinks; verbatim links retain their target text.
       await cp(origin, destination, {
         dereference: false,

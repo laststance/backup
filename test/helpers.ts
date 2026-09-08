@@ -27,6 +27,9 @@ export function useFixtures(): void {
   beforeAll(async () => {
     await mkdir(fixtureRoot, { recursive: true })
     const fixture = fileURLToPath(new URL('./fixtures/gh.mjs', import.meta.url))
+    const noBun = fileURLToPath(
+      new URL('./fixtures/no-bun.mjs', import.meta.url),
+    )
     if (process.platform === 'win32') {
       await runCommand(process.execPath, [
         'build',
@@ -34,9 +37,17 @@ export function useFixtures(): void {
         '--compile',
         `--outfile=${join(fixtureRoot, 'gh.exe')}`,
       ])
+      await runCommand(process.execPath, [
+        'build',
+        noBun,
+        '--compile',
+        `--outfile=${join(fixtureRoot, 'bun.exe')}`,
+      ])
     } else {
       await cp(fixture, join(fixtureRoot, 'gh'))
       await chmod(join(fixtureRoot, 'gh'), 0o755)
+      await cp(noBun, join(fixtureRoot, 'bun'))
+      await chmod(join(fixtureRoot, 'bun'), 0o755)
     }
   })
 
@@ -65,6 +76,7 @@ export async function createWorld() {
   const source = join(root, 'source')
   const home = join(root, 'home')
   await Promise.all([mkdir(repo), mkdir(source), mkdir(home)])
+  await writeFile(join(home, 'empty-gitconfig'), '[core]\nlongpaths = true\n')
   const ssh = fileURLToPath(new URL('./fixtures/ssh.mjs', import.meta.url))
   const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
   const env: NodeJS.ProcessEnv = {
@@ -85,6 +97,7 @@ export async function createWorld() {
     GIT_TERMINAL_PROMPT: '0',
     BACKUP_TEST_REMOTE: remote,
     BACKUP_TEST_GH_COUNTER: join(root, 'gh-count'),
+    BACKUP_TEST_BUN_CALLED: join(root, 'bun-called'),
   }
   // Isolate tests from repository and authentication variables inherited from the developer's shell.
   for (const key of Object.keys(env)) {
@@ -92,7 +105,8 @@ export async function createWorld() {
       /^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|CONFIG_COUNT|CONFIG_KEY_\d+|CONFIG_VALUE_\d+)$/.test(
         key,
       ) ||
-      /^(GH|GITHUB)_TOKEN$/.test(key)
+      /^(GH|GITHUB)_TOKEN$/.test(key) ||
+      (key.toUpperCase() === 'PATH' && key !== 'PATH')
     )
       delete env[key]
   }

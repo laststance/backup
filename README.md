@@ -89,7 +89,7 @@ bun run dev -- --help
 npm pack
 ```
 
-Bun builds TypeScript into one Node ESM CLI with no npm runtime dependencies. `prepack` builds the distributable. `bun run check` runs type checking, build, real-Git behavior tests, and an isolated npm tarball installation/Node/recovery test. macOS, Linux, and Windows run the same suite in CI; POSIX signal tests are Unix-only. The large-tree test covers 5,000 paths exceeding ordinary argv and 1 MiB output limits.
+Bun builds TypeScript into one Node ESM CLI with no npm runtime dependencies. `prepack` builds the distributable. `bun run check` runs type checking, build, real-Git behavior tests, and an isolated npm tarball installation/Node/recovery test. macOS, Linux, and Windows run the same suite in CI; POSIX signal, permission, and terminal tests are Unix-only. Terminal tests use Python 3's standard-library PTY module on Unix. The large-tree test covers 10,000 paths totaling over 2 MiB, and streamed output is tested with a slow consumer.
 
 ## Release
 

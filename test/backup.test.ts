@@ -10,6 +10,7 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { join } from 'node:path'
+import { version } from '../package.json'
 import { createWorld, put, recover, useFixtures } from './helpers'
 
 useFixtures()
@@ -111,9 +112,11 @@ test('reconciles an accepted push with a lost transport response on the next inv
   await put(join(world.source, 'foo.md'), 'accepted\n')
 
   // Act
-  await world
-    .cli(['--repo', world.repo, 'foo.md'], { BACKUP_TEST_LOST_RESPONSE: '1' })
-    .catch(() => undefined)
+  await expect(
+    world.cli(['--repo', world.repo, 'foo.md'], {
+      BACKUP_TEST_LOST_RESPONSE: '1',
+    }),
+  ).rejects.toThrow('Push completion is unconfirmed')
   const again = await world.cli(['foo.md'])
 
   // Assert
@@ -411,5 +414,5 @@ test('requires explicit registration without a terminal and reports corrupt conf
     'Cannot read configuration',
   )
   expect((await world.cli(['--help'])).stdout).toContain('Usage: backup')
-  expect((await world.cli(['--version'])).stdout.trim()).toBe('0.1.0')
+  expect((await world.cli(['--version'])).stdout.trim()).toBe(version)
 })

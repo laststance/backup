@@ -128,7 +128,7 @@ test('streams path lists exceeding argv and one-megabyte output limits', async (
   // Arrange
   const world = await createWorld()
   const nameTail = 'x'.repeat(220)
-  for (let index = 0; index < 5_000; index++)
+  for (let index = 0; index < 10_000; index++)
     await put(
       join(
         world.source,
@@ -157,8 +157,8 @@ test('streams path lists exceeding argv and one-megabyte output limits', async (
   )
 
   // Assert
-  expect(count).toBe(5_000)
-  expect(outputBytes).toBe(1_155_000)
+  expect(count).toBe(10_000)
+  expect(outputBytes).toBe(2_310_000)
 }, 120_000)
 
 test('terminates a timed-out subprocess and reports its failure', async () => {
