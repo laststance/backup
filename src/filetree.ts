@@ -357,6 +357,33 @@ export async function stageSource(
     [...source.entries].filter(([, entry]) => entry.kind !== 'directory'),
   )
   if (files.size) {
+    const fileMode = await git(
+      repository.directory,
+      ['config', '--bool', '--default', 'true', 'core.fileMode'],
+      signal,
+    )
+    // Git retains tracked modes and gives new files 100644 when filesystem executable bits are ignored.
+    if (fileMode.stdout.trim() === 'false') {
+      for (const [path, entry] of files) {
+        if (entry.kind === 'file') files.set(path, { ...entry, mode: '100644' })
+      }
+      await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
+        consume: async (output) => {
+          for await (const record of readNulRecords(output)) {
+            const separator = record.indexOf('\t')
+            const path = record.slice(separator + 1)
+            const entry = files.get(path)
+            const [mode, , stage] = record.slice(0, separator).split(' ')
+            if (
+              entry?.kind === 'file' &&
+              stage === '0' &&
+              (mode === '100644' || mode === '100755')
+            )
+              files.set(path, { ...entry, mode })
+          }
+        },
+      })
+    }
     await git(
       repository.directory,
       ['add', '--force', '--pathspec-from-file=-', '--pathspec-file-nul'],

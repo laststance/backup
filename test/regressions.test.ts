@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
 import {
+  chmod,
   lstat,
   readFile,
   readlink,
@@ -15,6 +16,35 @@ import { readRepository } from '../src/git'
 import { scanSource } from '../src/filetree'
 
 useFixtures()
+
+test('preserves tracked executable modes and adds normal files when Git ignores filesystem modes', async () => {
+  // Arrange
+  const world = await createWorld()
+  await world.git(['config', 'core.fileMode', 'false'])
+  await put(join(world.repo, 'run.sh'), 'old script\n')
+  await world.git(['add', 'run.sh'])
+  await world.git(['update-index', '--chmod=+x', 'run.sh'])
+  await world.git(['commit', '-m', 'track executable script'])
+  await put(join(world.source, 'run.sh'), 'updated script\n')
+  await put(join(world.source, 'new.sh'), 'new script\n')
+  await chmod(join(world.source, 'new.sh'), 0o755)
+  // Act
+  await world.cli(['--repo', world.repo, 'run.sh'])
+  const unchanged = await world.cli(['run.sh'])
+  await world.cli(['new.sh'])
+  // Assert
+  expect(
+    (await world.git(['ls-tree', 'main', 'run.sh'], world.remote)).stdout,
+  ).toStartWith('100755 blob ')
+  expect((await world.git(['show', 'main:run.sh'], world.remote)).stdout).toBe(
+    'updated script\n',
+  )
+  expect(
+    (await world.git(['ls-tree', 'main', 'new.sh'], world.remote)).stdout,
+  ).toStartWith('100644 blob ')
+  expect(unchanged.stdout).toContain('Unchanged')
+  expect((await world.git(['status', '--porcelain'])).stdout).toBe('')
+})
 
 test('repeats and updates dangling symlink backups without following targets', async () => {
   // Arrange
