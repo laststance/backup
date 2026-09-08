@@ -1,0 +1,49 @@
+{
+  "name": "@laststance/backup",
+  "version": "0.1.0",
+  "description": "Back up files and directories to an existing private GitHub repository.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "backup": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "bun@1.4.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laststance/backup.git"
+  },
+  "homepage": "https://github.com/laststance/backup#readme",
+  "bugs": {
+    "url": "https://github.com/laststance/backup/issues"
+  },
+  "keywords": [
+    "backup",
+    "cli",
+    "git",
+    "github",
+    "typescript"
+  ],
+  "scripts": {
+    "dev": "bun src/cli.ts",
+    "build": "bun build src/cli.ts --target=node --format=esm --outfile=dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test --timeout 30000",
+    "test:package": "bun test test/package.test.ts --timeout 60000",
+    "check": "bun run typecheck && bun run build && bun test --timeout 30000",
+    "prepack": "bun run build"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  }
+}
