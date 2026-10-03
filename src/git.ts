@@ -2,6 +2,7 @@ import { realpath } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { MIN_GIT_MAJOR_VERSION, MIN_GIT_MINOR_VERSION } from './constants'
 import type { BackupConfig } from './config'
+import { isGitHubName } from './utils/github-name'
 import { resolveLocalPath } from './utils/resolve-local-path'
 import { readNulRecords } from './utils/read-nul-records'
 import { runCommand } from './utils/run-command'
@@ -220,11 +221,7 @@ export function githubName(remote: string): string {
     pathname = url.pathname.replace(/^\//, '')
   }
   const name = pathname.replace(/\.git\/?$/, '').replace(/\/$/, '')
-  if (
-    !/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/.test(name) ||
-    name.endsWith('/.') ||
-    name.endsWith('/..')
-  ) {
+  if (!isGitHubName(name)) {
     throw new Error(
       'The effective remote does not identify a GitHub repository.',
     )
@@ -284,7 +281,9 @@ export async function verifyGitHub(
     typeof metadata !== 'object' ||
     metadata === null ||
     !('private' in metadata) ||
-    metadata.private !== true
+    metadata.private !== true ||
+    // Internal repositories report private:true yet are readable by every enterprise member.
+    (('visibility' in metadata) && metadata.visibility !== 'private')
   ) {
     throw new Error(
       'The destination must be a verified private GitHub repository.',
@@ -297,7 +296,7 @@ export async function verifyGitHub(
     metadata.id <= 0 ||
     !('full_name' in metadata) ||
     typeof metadata.full_name !== 'string' ||
-    !/^[\w.-]+\/[\w.-]+$/.test(metadata.full_name)
+    !isGitHubName(metadata.full_name)
   ) {
     throw new Error('GitHub returned invalid repository identity metadata.')
   }
@@ -314,7 +313,7 @@ export async function verifyGitHub(
     actions.enabled !== false
   ) {
     throw new Error(
-      'GitHub Actions must be disabled on the destination. Disable it in repository Settings > Actions > General; backup does not change this setting.',
+      `GitHub Actions must be disabled on the destination. Disable it in repository: https://github.com/${metadata.full_name}/settings/actions → Disable actions → Save`,
     )
   }
   return { repositoryId: metadata.id, githubRepository: metadata.full_name }

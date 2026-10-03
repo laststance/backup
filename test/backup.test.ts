@@ -133,7 +133,7 @@ test.each([
   [
     'enabled Actions',
     { BACKUP_TEST_ACTIONS: 'enabled' },
-    'Actions must be disabled',
+    'Disable it in repository: https://github.com/test-owner/private-backup/settings/actions',
   ],
   ['unverifiable API', { BACKUP_TEST_GH_ERROR: '1' }, 'GitHub API denied'],
 ])('rejects %s before copying', async (_label, environment, message) => {
