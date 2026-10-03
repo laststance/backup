@@ -180,6 +180,21 @@ test.each([
     '{"private":true,"id":"123456","full_name":"test-owner/private-backup"}',
     'invalid repository identity',
   ],
+  [
+    'dot-segment full_name',
+    '{"private":true,"id":123456,"full_name":"test-owner/.."}',
+    'invalid repository identity',
+  ],
+  [
+    'overlong full_name',
+    `{"private":true,"id":123456,"full_name":"${'o'.repeat(40)}/${'r'.repeat(101)}"}`,
+    'invalid repository identity',
+  ],
+  [
+    'internal visibility',
+    '{"private":true,"visibility":"internal","id":123456,"full_name":"test-owner/private-backup"}',
+    'verified private GitHub repository',
+  ],
 ])('rejects %s GitHub metadata', async (_label, metadata, message) => {
   // Arrange
   const world = await createWorld()
@@ -188,6 +203,74 @@ test.each([
     world.cli(['--repo', world.repo], { BACKUP_TEST_METADATA: metadata }),
   ).rejects.toThrow(message)
 })
+
+test.each([
+  ['https', 'https://github.com/test-owner/private-backup'],
+  ['https with .git', 'https://github.com/test-owner/private-backup.git'],
+  ['ssh URL', 'ssh://git@github.com/test-owner/private-backup.git'],
+  ['ssh URL port 22', 'ssh://git@github.com:22/test-owner/private-backup.git'],
+  [
+    'ssh.github.com port 443',
+    'ssh://git@ssh.github.com:443/test-owner/private-backup.git',
+  ],
+  [
+    'underscore owner (managed user)',
+    'git@github.com:test_owner/private-backup.git',
+  ],
+])('accepts %s remote URL during registration', async (_label, url) => {
+  // Arrange
+  const world = await createWorld()
+  await world.git(['remote', 'set-url', 'origin', url])
+  // Act / Assert
+  await world.cli(['--repo', world.repo])
+})
+
+test.each([
+  [
+    'dot-segment repository',
+    'git@github.com:test-owner/..',
+    'does not identify a GitHub repository',
+  ],
+  [
+    'dot repository',
+    'git@github.com:test-owner/.',
+    'does not identify a GitHub repository',
+  ],
+  [
+    'missing repository segment',
+    'https://github.com/test-owner',
+    'does not identify a GitHub repository',
+  ],
+  [
+    'spaced repository name',
+    'git@github.com:test-owner/re po.git',
+    'does not identify a GitHub repository',
+  ],
+  [
+    'underscore-prefixed owner',
+    'git@github.com:_owner/private-backup.git',
+    'does not identify a GitHub repository',
+  ],
+  [
+    'overlong name',
+    `git@github.com:${'o'.repeat(40)}/${'r'.repeat(101)}`,
+    'does not identify a GitHub repository',
+  ],
+  [
+    'non-GitHub host',
+    'https://gitlab.com/test-owner/private-backup',
+    'GitHub.com HTTPS or SSH endpoint',
+  ],
+])(
+  'rejects %s remote URL during registration',
+  async (_label, url, message) => {
+    // Arrange
+    const world = await createWorld()
+    await world.git(['remote', 'set-url', 'origin', url])
+    // Act / Assert
+    await expect(world.cli(['--repo', world.repo])).rejects.toThrow(message)
+  },
+)
 
 test('rejects a registered branch missing from a nonempty remote', async () => {
   // Arrange

@@ -8,6 +8,7 @@ import {
   PRIVATE_DIRECTORY_MODE,
   PRIVATE_FILE_MODE,
 } from './constants'
+import { isGitHubName } from './utils/github-name'
 import { maybeLstat } from './utils/maybe-lstat'
 
 export type BackupConfig = {
@@ -56,7 +57,7 @@ export async function loadConfig(): Promise<BackupConfig | undefined> {
       value.repositoryId <= 0 ||
       !('githubRepository' in value) ||
       typeof value.githubRepository !== 'string' ||
-      !/^[\w.-]+\/[\w.-]+$/.test(value.githubRepository)
+      !isGitHubName(value.githubRepository)
     ) {
       throw new Error('Invalid configuration fields.')
     }

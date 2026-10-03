@@ -32,6 +32,7 @@ if (endpoint?.endsWith('/actions/permissions')) {
     JSON.stringify({
       id: Number(process.env.BACKUP_TEST_REPOSITORY_ID ?? 123456),
       private: process.env.BACKUP_TEST_PUBLIC !== '1',
+      visibility: process.env.BACKUP_TEST_PUBLIC === '1' ? 'public' : 'private',
       full_name: 'test-owner/private-backup',
       archived: false,
     }),
