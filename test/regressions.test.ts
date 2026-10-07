@@ -245,10 +245,12 @@ test('accepts the exact 100 MiB boundary during whole-source preflight', async (
   await put(file, '')
   await truncate(file, 100 * 1024 * 1024)
   // Act
+  // Keep the size boundary independent of whether the host's temp directory is beneath home.
   const source = await scanSource(
     file,
     await readRepository(world.repo, signal),
     signal,
+    'limit.bin',
   )
   // Assert
   expect([...source.entries.keys()]).toEqual(['limit.bin'])
