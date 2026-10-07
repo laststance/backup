@@ -9,7 +9,12 @@ import { version } from '../package.json'
 const HELP = `Usage: backup [--repo <directory>] <file-or-directory>
 
 Copy one source into an existing private GitHub clone, commit, and push.
-The source basename becomes its path at the repository root.
+Relative sources retain their path below the current working directory.
+Absolute sources beneath home (including ~/) retain their path below home;
+absolute sources outside home use their basename. Missing parents are created.
+Existing parents must be directories, not files, symlinks, or submodules;
+Git metadata paths and conflicting tracked spellings are rejected.
+Old flattened backups and unselected files are retained.
 
 Options:
   --repo <directory>  Register an existing private clone (alone: setup only)
@@ -18,7 +23,8 @@ Options:
 
 Examples:
   backup --repo ~/private-backup
-  backup foo.md
+  backup cooking/too.txt
+  backup ~/cooking/too.txt
   backup ./notes
   backup -- -draft.md
 
@@ -87,7 +93,7 @@ try {
         {
           ...(directory ? { directory } : {}),
           ...(config ? { config } : {}),
-          ...(source ? { source } : {}),
+          ...(source !== undefined ? { source } : {}),
         },
         controller.signal,
       ),

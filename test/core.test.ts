@@ -1,12 +1,25 @@
 import { expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
-import { chmod, lstat, mkdir, readFile, rm, symlink } from 'node:fs/promises'
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  symlink,
+} from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createWorld, nodePath, projectRoot, put, useFixtures } from './helpers'
 import { runCommand } from '../src/utils/run-command'
 import { readNulRecords } from '../src/utils/read-nul-records'
-import { copySource, scanSource, validateDestination } from '../src/filetree'
+import {
+  copySource,
+  scanSource,
+  stageSource,
+  validateDestination,
+} from '../src/filetree'
 import { readRepository } from '../src/git'
 
 useFixtures()
@@ -58,26 +71,31 @@ test('rejects divergent remote history without overwriting local files or force 
   )
 })
 
-test('rechecks a destination directory replaced by a symlink during fast-forward', async () => {
-  // Arrange
-  const world = await createWorld()
-  await put(join(world.source, 'notes', 'file.md'), 'initial\n')
-  await world.cli(['--repo', world.repo, 'notes'])
-  const initial = (await world.git(['rev-parse', 'HEAD'])).stdout.trim()
-  await mkdir(join(world.root, 'outside'))
-  await rm(join(world.repo, 'notes'), { recursive: true })
-  await symlink(join(world.root, 'outside'), join(world.repo, 'notes'), 'dir')
-  await world.commit('remote replaces directory with link')
-  await world.git(['push', 'origin', 'main'])
-  await world.git(['reset', '--hard', initial])
-  await put(join(world.source, 'notes', 'file.md'), 'must not escape\n')
+test.each(['notes', 'notes/file.md'])(
+  'rechecks a destination directory replaced by a symlink during fast-forward (%s)',
+  async (selection) => {
+    // Arrange
+    const world = await createWorld()
+    await put(join(world.source, 'notes', 'file.md'), 'initial\n')
+    await world.cli(['--repo', world.repo, 'notes'])
+    const initial = (await world.git(['rev-parse', 'HEAD'])).stdout.trim()
+    await mkdir(join(world.root, 'outside'))
+    await rm(join(world.repo, 'notes'), { recursive: true })
+    await symlink(join(world.root, 'outside'), join(world.repo, 'notes'), 'dir')
+    await world.commit('remote replaces directory with link')
+    await world.git(['push', 'origin', 'main'])
+    await world.git(['reset', '--hard', initial])
+    await put(join(world.source, 'notes', 'file.md'), 'must not escape\n')
 
-  // Act / Assert
-  await expect(world.cli(['notes'])).rejects.toThrow('entry type conflicts')
-  expect(
-    await lstat(join(world.root, 'outside', 'file.md')).catch(() => undefined),
-  ).toBeUndefined()
-})
+    // Act / Assert
+    await expect(world.cli([selection])).rejects.toThrow('entry type conflicts')
+    expect(
+      await lstat(join(world.root, 'outside', 'file.md')).catch(
+        () => undefined,
+      ),
+    ).toBeUndefined()
+  },
+)
 
 test('detects source bytes changed after preflight and reports a copy failure without pushing', async () => {
   // Arrange
@@ -238,5 +256,237 @@ test.skipIf(process.platform === 'win32')(
     } finally {
       child.kill('SIGKILL')
     }
+  },
+)
+
+test('detects mapped source mutation between preflight and copy without pushing', async () => {
+  // Arrange
+  const world = await createWorld()
+  const signal = new AbortController().signal
+  const repository = await readRepository(world.repo, signal)
+  const path = join(world.source, 'cooking', 'too.txt')
+  await put(path, 'before\n')
+  const source = await scanSource(path, repository, signal, 'cooking/too.txt')
+  await validateDestination(source, repository, signal)
+  await put(path, 'after\n')
+  // Act / Assert
+  await expect(copySource(source, repository, signal)).rejects.toThrow(
+    'Copied content changed: "cooking/too.txt"',
+  )
+  expect(
+    (await world.git(['show-ref'], world.remote).catch(() => ({ stdout: '' })))
+      .stdout,
+  ).toBe('')
+})
+
+test.each(['outside', 'inside'])(
+  'rejects a destination parent replaced after preflight with a symlink pointing %s',
+  async (target) => {
+    // Arrange
+    const world = await createWorld()
+    const signal = new AbortController().signal
+    const repository = await readRepository(world.repo, signal)
+    const path = join(world.source, 'cooking', 'recipes', 'too.txt')
+    await put(path, 'must not escape\n')
+    await mkdir(join(world.repo, 'cooking'))
+    const source = await scanSource(
+      path,
+      repository,
+      signal,
+      'cooking/recipes/too.txt',
+    )
+    await validateDestination(source, repository, signal)
+    const linkTarget = join(
+      target === 'outside' ? world.root : world.repo,
+      'elsewhere',
+    )
+    await mkdir(linkTarget)
+    await rm(join(world.repo, 'cooking'), { recursive: true })
+    await symlink(linkTarget, join(world.repo, 'cooking'), 'dir')
+    // Act / Assert
+    await expect(copySource(source, repository, signal)).rejects.toThrow(
+      'parent changed',
+    )
+    expect(
+      await lstat(join(linkTarget, 'recipes')).catch(() => undefined),
+    ).toBeUndefined()
+    expect(
+      (
+        await world
+          .git(['show-ref'], world.remote)
+          .catch(() => ({ stdout: '' }))
+      ).stdout,
+    ).toBe('')
+  },
+)
+
+test.each(['too.txt', 'cooking/too.txt'])(
+  'rejects a replaced clone root before creating parents or copying the selected file (%s)',
+  async (selected) => {
+    // Arrange
+    const world = await createWorld()
+    const signal = new AbortController().signal
+    const repository = await readRepository(world.repo, signal)
+    const path = join(world.source, selected)
+    await put(path, 'must not escape\n')
+    const source = await scanSource(path, repository, signal, selected)
+    await validateDestination(source, repository, signal)
+    const outside = join(world.root, 'outside')
+    await mkdir(outside)
+    await rename(world.repo, join(world.root, 'original-vault'))
+    await symlink(outside, world.repo, 'dir')
+    // Act / Assert
+    await expect(copySource(source, repository, signal)).rejects.toThrow(
+      'Destination parent changed',
+    )
+    expect(
+      await lstat(join(outside, 'too.txt')).catch(() => undefined),
+    ).toBeUndefined()
+    expect(
+      await lstat(join(outside, 'cooking')).catch(() => undefined),
+    ).toBeUndefined()
+  },
+)
+
+test('preserves a mapped source-parent alias through copy and stability rescan', async () => {
+  // Arrange
+  const world = await createWorld()
+  const signal = new AbortController().signal
+  const repository = await readRepository(world.repo, signal)
+  await put(join(world.source, 'actual', 'too.txt'), 'linked parent\n')
+  await symlink(
+    join(world.source, 'actual'),
+    join(world.source, 'cooking'),
+    'dir',
+  )
+  const source = await scanSource(
+    join(world.source, 'cooking', 'too.txt'),
+    repository,
+    signal,
+    'cooking/too.txt',
+  )
+  await validateDestination(source, repository, signal)
+  // Act
+  await copySource(source, repository, signal)
+  const changed = await stageSource(source, repository, signal)
+  // Assert
+  expect(changed).toBe(true)
+  expect([...source.entries.keys()]).toEqual(['cooking/too.txt'])
+  expect(await readFile(join(world.repo, 'cooking', 'too.txt'), 'utf8')).toBe(
+    'linked parent\n',
+  )
+  expect((await world.git(['diff', '--cached', '--name-only'])).stdout).toBe(
+    'cooking/too.txt\n',
+  )
+})
+
+test('detects staged-byte conversion for a nested mapped source before pushing', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, '.gitattributes'), '*.txt text eol=lf\n')
+  await world.commit()
+  await put(join(world.source, 'cooking', 'too.txt'), 'one\r\ntwo\r\n')
+  // Act / Assert
+  await expect(
+    world.cli(['--repo', world.repo, 'cooking/too.txt']),
+  ).rejects.toThrow(
+    'Git changed the selected bytes or entry type: "cooking/too.txt"',
+  )
+  expect(
+    (await world.git(['show-ref'], world.remote).catch(() => ({ stdout: '' })))
+      .stdout,
+  ).toBe('')
+})
+
+test.skipIf(process.platform === 'linux').each([
+  ['Cooking', 'cooking'],
+  ['Cafe\u0301', 'Café'],
+])(
+  'rejects tracked ancestor spelling collisions on case-insensitive filesystems (%s, %s)',
+  async (tracked, selected) => {
+    // Arrange
+    const world = await createWorld()
+    const lower = await lstat(join(world.repo, '.git'))
+    const upper = await lstat(join(world.repo, '.GIT')).catch(() => undefined)
+    // A developer may use a case-sensitive macOS volume even though the platform supports case-insensitive volumes.
+    if (upper?.ino !== lower.ino || upper?.dev !== lower.dev) return
+    await world.git(['config', 'core.precomposeUnicode', 'false'])
+    await put(join(world.repo, tracked, 'keep.txt'), 'retained\n')
+    await world.commit()
+    await put(join(world.source, selected, 'too.txt'), 'must not copy\n')
+    // Act / Assert
+    await expect(
+      world.cli(['--repo', world.repo, `${selected}/too.txt`]),
+    ).rejects.toThrow('Tracked path collision')
+    expect(
+      await lstat(join(world.repo, selected, 'too.txt')).catch(() => undefined),
+    ).toBeUndefined()
+    expect(
+      (
+        await world
+          .git(['show-ref'], world.remote)
+          .catch(() => ({ stdout: '' }))
+      ).stdout,
+    ).toBe('')
+  },
+)
+
+test.skipIf(process.platform === 'win32')(
+  'resolves fully absolute and home-prefixed sources after the invocation directory is removed',
+  async () => {
+    // Arrange
+    const world = await createWorld()
+    const absolute = join(world.home, 'cooking', 'too.txt')
+    const fixture = join(world.root, 'removed-cwd.mjs')
+    await runCommand(process.execPath, [
+      'build',
+      join(projectRoot, 'test', 'fixtures', 'removed-cwd.mjs'),
+      '--target=node',
+      `--outfile=${fixture}`,
+    ])
+    // Act
+    const result = await runCommand(
+      nodePath,
+      [fixture, absolute, world.home, world.source],
+      { cwd: world.root },
+    )
+    // Assert
+    expect(JSON.parse(result.stdout)).toEqual([
+      { path: absolute, name: 'cooking/too.txt' },
+      { path: absolute, name: 'cooking/too.txt' },
+    ])
+  },
+)
+
+// Generated by /ship Step 7.
+// Value: protects=mapped copies reject same-byte source identity changes before staging; fails_when=the mapped stability rescan is skipped or compares only copied bytes; why_new=existing mutation tests change bytes and fail before the final source rescan; seam=none
+test(
+  'rejects a mapped source replaced with identical bytes after preflight before staging',
+  async () => {
+    // Arrange
+    const world = await createWorld()
+    const signal = new AbortController().signal
+    const repository = await readRepository(world.repo, signal)
+    const file = join(world.source, 'cooking', 'too.txt')
+    await put(file, 'selected recipe\n')
+    const source = await scanSource(
+      file,
+      repository,
+      signal,
+      'cooking/too.txt',
+    )
+    await validateDestination(source, repository, signal)
+    // Keep the original inode alive so replacement cannot reuse its identity.
+    await rename(file, join(world.root, 'original-too.txt'))
+    await put(file, 'selected recipe\n')
+
+    // Act / Assert
+    await expect(copySource(source, repository, signal)).rejects.toThrow(
+      'Source changed during copying: "cooking/too.txt"',
+    )
+    expect(
+      await readFile(join(world.repo, 'cooking', 'too.txt'), 'utf8'),
+    ).toBe('selected recipe\n')
+    expect((await world.git(['diff', '--cached', '--name-only'])).stdout).toBe('')
   },
 )

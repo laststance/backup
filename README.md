@@ -36,12 +36,26 @@ Show usage with `backup --help` (`-h`) or the installed version with `backup --v
 
 ## Copy and push behavior
 
-| Input                    | Destination       |
-| ------------------------ | ----------------- |
-| `backup ./drafts/foo.md` | `<clone>/foo.md`  |
-| `backup ./notes`         | `<clone>/notes/…` |
+Relative sources preserve their path from the directory where you run the command. Home-relative sources (`~/…`) and absolute sources inside your home preserve their path below your home directory, regardless of where you run the command.
 
-- One source per command. Same-type files are overwritten; files absent from the source are retained. Sources sharing a basename share their destination.
+| Input | Destination |
+| --- | --- |
+| `backup cooking/too.txt` | `<clone>/cooking/too.txt` only |
+| `backup ./cooking/too.txt` | `<clone>/cooking/too.txt` only |
+| `backup ~/cooking/too.txt` | `<clone>/cooking/too.txt` only |
+| `backup /home/example/cooking/too.txt` (home is `/home/example`) | `<clone>/cooking/too.txt` only |
+| `backup cooking` | `<clone>/cooking/…`, recursively |
+| `backup cooking/recipes` | `<clone>/cooking/recipes/…`, recursively |
+| `backup /var/tmp/cooking/too.txt` (outside home) | `<clone>/too.txt` |
+
+Missing parent directories are created automatically. Selecting one file does not copy its siblings. An absolute source outside your home keeps the previous basename-only behavior. `backup .` and `backup ~` put the selected directory under its own basename rather than merging it into the clone root. These mapping rules use lexical paths; resolving a source-parent symlink does not rename its destination.
+
+Relative paths may contain `.` or `..` when normalization stays inside the invocation directory. To select a source outside that directory, use an absolute or home-relative path. Filesystem roots, empty source strings, and ambiguous Windows drive-relative paths such as `C:foo` are rejected. On Windows, native path separators are accepted; a backslash in a POSIX filename remains literal. Use `backup -- -draft.md` for a source beginning with a dash.
+
+**Upgrading from 0.1.1:** nested relative sources and absolute sources inside your home now keep their directory structure. Previously flattened backups remain in place. For example, an old `<clone>/too.txt` remains after a new backup creates `<clone>/cooking/too.txt`; nothing is moved or deleted automatically.
+
+- One source per command. Same-type files at the same destination are overwritten; files absent from the source are retained. `one/foo.md` and `two/foo.md` have separate destinations.
+- Destination parents must be ordinary directories. A file, symlink, submodule, Git metadata path, or conflicting tracked ancestor stops the backup before payload copying. Parents are checked again while copying; avoid changing the destination concurrently.
 - Files hidden by `.gitignore` are included when selected. Exact `.git` entries at every source depth are excluded; metadata aliases such as `.GIT` reject the operation.
 - Regular file bytes, executable bits where Git tracks filesystem modes, and symlink target text/types are checked against the staged Git blobs before committing. With `core.fileMode=false` (usual on Windows), existing Git executable modes are preserved and new regular files use `100644`. Symlinks are copied without following them. On Windows, creating/restoring symlinks requires Developer Mode or suitable privileges.
 - Git for Windows stores symlink target separators as `/` and restores native `\` separators on checkout. Backup verifies that Git representation on Windows; Unix symlink target text remains literal. Regular file bytes are never normalized.
@@ -51,7 +65,7 @@ Show usage with `backup --help` (`-h`) or the installed version with `backup --v
 - The remote must resolve to one GitHub.com private repository for both fetch and push. Privacy, identity, and **Actions disabled** are checked before copying and again before push. An unverifiable check fails closed.
 - The registered branch is fetched and fast-forwarded before copying. Divergent histories, dirty working trees, detached HEAD, and branch changes stop the operation. No force push is used.
 - **All pending commits on the registered branch are pushed, including manual commits.** An unchanged source still pushes pending history. With no changes and no pending commits, the command reports `Unchanged`.
-- A changed backup uses `chore(backup): update <basename>`. A repository lock serializes CLI invocations, including linked worktrees. Avoid running other Git commands or changing source/destination files during a backup; the lock does not control other programs.
+- A changed backup uses `chore(backup): update <relative-path>`, such as `chore(backup): update cooking/too.txt`. A repository lock serializes CLI invocations, including linked worktrees. Avoid running other Git commands or changing source/destination files during a backup; the lock does not control other programs.
 
 ## Recover your files
 

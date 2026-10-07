@@ -56,6 +56,11 @@ test('installs the npm tarball and recovers exact files and links using Node wit
   if (process.platform !== 'win32')
     await chmod(join(world.source, 'notes', 'run.sh'), 0o755)
   await symlink('../missing.md', join(world.source, 'notes', 'link'))
+  await put(
+    join(world.source, 'cooking', 'too.txt'),
+    'selected packaged bytes\n',
+  )
+  await put(join(world.source, 'cooking', 'other.txt'), 'unselected sibling\n')
 
   // Act
   await npm(
@@ -71,6 +76,10 @@ test('installs the npm tarball and recovers exact files and links using Node wit
     consumer,
     world.env,
   )
+  await world.cli(['cooking/too.txt'], {}, entry)
+  const remotePaths = (
+    await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote)
+  ).stdout
   const help = await npm(
     ['exec', '--offline', '--', 'backup', '--help'],
     consumer,
@@ -85,6 +94,12 @@ test('installs the npm tarball and recovers exact files and links using Node wit
 
   // Assert
   expect(help.stdout).toContain('Usage: backup')
+  expect(remotePaths.split('\n')).toContain('cooking/too.txt')
+  expect(remotePaths.split('\n')).not.toContain('too.txt')
+  expect(remotePaths.split('\n')).not.toContain('cooking/other.txt')
+  expect(await readFile(join(restored, 'cooking', 'too.txt'), 'utf8')).toBe(
+    'selected packaged bytes\n',
+  )
   expect(reportedVersion.stdout.trim()).toBe(version)
   expect(
     await lstat(join(world.root, 'bun-called')).catch(() => undefined),
