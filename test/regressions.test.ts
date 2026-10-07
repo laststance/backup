@@ -230,7 +230,7 @@ test('uses the common repository lock for linked worktrees and rejects their met
   await expect(world.cli(['foo.md'])).rejects.toThrow('Backup lock exists')
   await rm(lock, { recursive: true })
   await expect(world.cli([join(world.repo, '.git', 'config')])).rejects.toThrow(
-    'must not overlap',
+    'Git metadata alias in source',
   )
   expect(
     (await world.git(['rev-parse', '--git-common-dir'], linked)).stdout.trim(),
@@ -272,7 +272,7 @@ test.skipIf(process.platform === 'win32')(
   },
 )
 
-test('overwrites the same basename on later backups and preserves other committed paths', async () => {
+test('preserves two same-basename files beneath their respective selected directories', async () => {
   // Arrange
   const world = await createWorld()
   await put(join(world.source, 'one', 'foo.md'), 'first\n')
@@ -281,9 +281,15 @@ test('overwrites the same basename on later backups and preserves other committe
   // Act
   await world.cli(['two/foo.md'])
   // Assert
-  expect((await world.git(['show', 'main:foo.md'], world.remote)).stdout).toBe(
-    'second\n',
-  )
+  expect(
+    (await world.git(['show', 'main:one/foo.md'], world.remote)).stdout,
+  ).toBe('first\n')
+  expect(
+    (await world.git(['show', 'main:two/foo.md'], world.remote)).stdout,
+  ).toBe('second\n')
+  expect(
+    await lstat(join(world.repo, 'foo.md')).catch(() => undefined),
+  ).toBeUndefined()
   expect(
     (
       await world.git(['rev-list', '--count', 'main'], world.remote)

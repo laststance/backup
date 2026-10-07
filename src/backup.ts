@@ -134,7 +134,7 @@ export async function backup(
         )
       await validateRegistration(repository, config, signal)
     }
-    if (!options.source)
+    if (options.source === undefined)
       return `Registered ${config.githubRepository} (${config.branch}) at ${JSON.stringify(config.directory)}.`
 
     // lock -> validate -> fetch/ff -> revalidate -> preflight -> copy -> stage/verify -> commit/verify -> push

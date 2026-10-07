@@ -17,7 +17,8 @@ import { EXECUTABLE_MODE_MASK, MAX_FILE_SIZE_BYTES } from './constants'
 import { isWithin } from './utils/is-within'
 import { maybeLstat } from './utils/maybe-lstat'
 import { readNulRecords } from './utils/read-nul-records'
-import { resolveLocalPath } from './utils/resolve-local-path'
+import { metadataAlias } from './utils/metadata-alias'
+import { resolveBackupPath } from './utils/resolve-backup-path'
 
 export type Entry = {
   kind: 'directory' | 'file' | 'symlink'
@@ -25,7 +26,13 @@ export type Entry = {
   oid: string
   signature: string
 }
-export type Source = { path: string; name: string; entries: Map<string, Entry> }
+export type Source = {
+  /** Source location with a canonical parent, retaining a selected leaf symlink. */
+  path: string
+  /** Preserved repository-relative destination root, shared by all manifest keys. */
+  name: string
+  entries: Map<string, Entry>
+}
 
 /** Captures metadata for {@link scanSource} to detect replacement or writes while bytes are read.
  * @param stats - Non-following, nanosecond-resolution entry metadata.
@@ -41,23 +48,6 @@ function signature(stats: BigIntStats): string {
     stats.mtimeNs,
     stats.ctimeNs,
   ].join(':')
-}
-
-/** Rejects Git metadata aliases during {@link scanSource}, including common case/NTFS/HFS spellings.
- * @param name - One filesystem component.
- * @returns Whether the component could address Git metadata.
- * @example metadataAlias(".GIT") // => true
- */
-function metadataAlias(name: string): boolean {
-  const normalized = name
-    .replace(/[\u200c\u200d\ufeff]/g, '')
-    .replace(/[ .]+$/, '')
-    .toLowerCase()
-  return (
-    normalized === '.git' ||
-    normalized.startsWith('.git:') ||
-    /^git~\d+(?:\.|:|$)/.test(normalized)
-  )
 }
 
 /** Hashes raw entries for {@link scanSource} and {@link copySource}, independently of Git filters.
@@ -116,21 +106,33 @@ async function readEntry(
  * @param input - One source file, directory, or symlink.
  * @param repository - Destination root and protected metadata directories.
  * @param signal - CLI cancellation signal.
- * @returns Canonical source parent, root basename, and byte/type manifest.
+ * @param destinationName - Previously validated mapping reused by {@link copySource} during its stability rescan.
+ * @returns Canonical source parent, mapped destination root, and byte/type manifest.
  * @example await scanSource("./notes", repository, signal)
  */
 export async function scanSource(
   input: string,
   repository: Repository,
   signal: AbortSignal,
+  destinationName?: string,
 ): Promise<Source> {
-  const resolved = resolveLocalPath(input)
-  const name = basename(resolved)
-  if (!name || metadataAlias(name))
-    throw new Error(
-      'The source root cannot be a filesystem root or Git metadata.',
-    )
-  const path = join(await realpath(dirname(resolved)), name)
+  // Internal rescans reuse the approved location and mapping; canonical parent aliases are not fresh CLI input.
+  const mapping =
+    destinationName === undefined
+      ? resolveBackupPath(input)
+      : { path: input, name: destinationName }
+  const resolved = mapping.path
+  const name = mapping.name
+  // A rescan preserves its original mapping, while still rejecting invalid internal keys.
+  if (
+    name
+      .split('/')
+      .some(
+        (part) => !part || part === '.' || part === '..' || metadataAlias(part),
+      )
+  )
+    throw new Error(`Invalid destination path: ${JSON.stringify(name)}`)
+  const path = join(await realpath(dirname(resolved)), basename(resolved))
   if (
     isWithin(repository.directory, path) ||
     isWithin(path, repository.directory) ||
@@ -175,11 +177,55 @@ export async function scanSource(
   return { path, name, entries }
 }
 
+/** Lists the ordered parents needed by {@link validateDestination} and {@link copySource} without selecting siblings.
+ * @param path - Slash-separated destination key.
+ * @returns Ancestors from the clone root toward the selected entry.
+ * @example destinationAncestors('cooking/recipes/a.txt') // => ['cooking', 'cooking/recipes']
+ */
+function destinationAncestors(path: string): string[] {
+  const components = path.split('/')
+  return components
+    .slice(0, -1)
+    .map((_, index) => components.slice(0, index + 1).join('/'))
+}
+
+/** Checks an existing directory without following a link for destination preflight and copy-time parent rechecks.
+ * @param path - Repository-relative directory key.
+ * @param repository - Destination root and protected metadata locations.
+ * @returns Whether the directory already exists.
+ * @throws When the directory aliases metadata, escapes the clone, or is a file or symlink.
+ * @example await checkDestinationDirectory('cooking', repository)
+ */
+async function checkDestinationDirectory(
+  path: string,
+  repository: Repository,
+): Promise<boolean> {
+  const destination = join(repository.directory, ...path.split('/'))
+  const stats = await maybeLstat(destination)
+  if (!stats) return false
+  // lstat rejects links even when they point back into the clone.
+  if (!stats.isDirectory())
+    throw new Error(
+      `Destination entry type conflicts or parent changed: ${JSON.stringify(path)}`,
+    )
+  const canonical = await realpath(destination)
+  if (
+    !isWithin(repository.directory, canonical) ||
+    [repository.gitDirectory, repository.commonDirectory].some((metadata) =>
+      isWithin(metadata, canonical),
+    )
+  )
+    throw new Error(
+      `Destination aliases protected metadata or escapes the repository: ${JSON.stringify(path)}`,
+    )
+  return true
+}
+
 /** Validates the whole destination after fetch and before {@link copySource}, preventing partial conflict writes.
  * @param source - Complete source manifest.
  * @param repository - Locked destination working tree.
  * @param signal - CLI cancellation signal.
- * @returns Resolves only when all selected paths can be merged safely.
+ * @returns Resolves only when all selected paths and their required parents can be merged safely.
  * @example await validateDestination(source, repository, signal)
  */
 export async function validateDestination(
@@ -197,29 +243,36 @@ export async function validateDestination(
   const canonicalKey = (path: string) =>
     caseInsensitive ? path.normalize('NFC').toLowerCase() : path
   const selected = new Map<string, string>()
-  for (const [path, entry] of source.entries) {
+  const required = new Map<string, { path: string; kind: Entry['kind'] }>()
+  const paths = [
+    ...destinationAncestors(source.name).map(
+      (path) => [path, { kind: 'directory' as const }] as const,
+    ),
+    ...source.entries,
+  ]
+  for (const [path, entry] of paths) {
     signal.throwIfAborted()
     const key = canonicalKey(path)
-    const collision = selected.get(key)
-    if (collision && collision !== path)
+    const collision = required.get(key)
+    if (collision && collision.path !== path)
       throw new Error(
-        `Source paths collide on this filesystem: ${JSON.stringify(collision)}, ${JSON.stringify(path)}`,
+        `Source paths collide on this filesystem: ${JSON.stringify(collision.path)}, ${JSON.stringify(path)}`,
       )
-    selected.set(key, path)
+    required.set(key, { path, kind: entry.kind })
+    if (source.entries.has(path)) selected.set(key, path)
+    // Parent directories are checked before descendants, so lstat never traverses an unchecked ancestor.
+    if (entry.kind === 'directory') {
+      await checkDestinationDirectory(path, repository)
+      continue
+    }
     const destination = join(repository.directory, ...path.split('/'))
     const stats = await maybeLstat(destination)
     if (!stats) continue
-    const sameKind =
-      entry.kind === 'directory'
-        ? stats.isDirectory()
-        : entry.kind === 'symlink'
-          ? stats.isSymbolicLink()
-          : stats.isFile()
-    if (!sameKind)
+    if (entry.kind === 'symlink' ? !stats.isSymbolicLink() : !stats.isFile())
       throw new Error(
         `Destination entry type conflicts: ${JSON.stringify(path)}. No files were copied.`,
       )
-    // Leaves may be symlinks because copy never follows them; directory parents may not be links.
+    // Selected leaf symlinks remain valid; copying preserves the link itself.
     if (!stats.isSymbolicLink()) {
       const canonical = await realpath(destination)
       if (
@@ -227,11 +280,10 @@ export async function validateDestination(
         [repository.gitDirectory, repository.commonDirectory].some((metadata) =>
           isWithin(metadata, canonical),
         )
-      ) {
+      )
         throw new Error(
           `Destination aliases protected metadata or escapes the repository: ${JSON.stringify(path)}`,
         )
-      }
     }
   }
   await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
@@ -239,29 +291,66 @@ export async function validateDestination(
       for await (const record of readNulRecords(output)) {
         const separator = record.indexOf('\t')
         const path = record.slice(separator + 1)
-        const selectedPath = selected.get(canonicalKey(path))
-        if (!selectedPath) continue
-        if (selectedPath !== path || record.startsWith('160000 '))
-          throw new Error(
-            `Tracked path collision or submodule: ${JSON.stringify(path)}`,
+        // Every tracked prefix participates, including parents of unrelated tracked siblings.
+        for (const prefix of [...destinationAncestors(path), path]) {
+          const target = required.get(canonicalKey(prefix))
+          if (!target) continue
+          if (
+            target.path !== prefix ||
+            (prefix !== path && target.kind !== 'directory') ||
+            (prefix === path &&
+              (record.startsWith('160000 ') || target.kind === 'directory'))
           )
+            throw new Error(
+              `Tracked path collision or submodule: ${JSON.stringify(path)}`,
+            )
+        }
       }
     },
   })
   await git(repository.directory, ['ls-files', '-v', '-z'], signal, {
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
+        // Flags on unselected siblings do not prevent creating their shared parent.
         if (
           selected.has(canonicalKey(record.slice(2))) &&
           (record[0] === 'S' || record[0] !== record[0]?.toUpperCase())
-        ) {
+        )
           throw new Error(
             `Selected path has skip-worktree or assume-unchanged set: ${JSON.stringify(record.slice(2))}. Clear the flag and retry.`,
           )
-        }
       }
     },
   })
+}
+
+/** Creates and rechecks each destination parent for {@link copySource} without traversing symlinks.
+ * @param path - Selected repository-relative destination key.
+ * @param repository - Preflighted destination clone.
+ * @param signal - CLI cancellation signal.
+ * @example await prepareDestinationParents('cooking/recipes/a.txt', repository, signal)
+ */
+async function prepareDestinationParents(
+  path: string,
+  repository: Repository,
+  signal: AbortSignal,
+): Promise<void> {
+  for (const ancestor of destinationAncestors(path)) {
+    signal.throwIfAborted()
+    if (await checkDestinationDirectory(ancestor, repository)) continue
+    // Create one component at a time; recursive mkdir could follow a substituted link.
+    try {
+      await mkdir(join(repository.directory, ...ancestor.split('/')))
+    } catch (error) {
+      if (!(
+        error instanceof Error &&
+        'code' in error &&
+        error.code === 'EEXIST'
+      ))
+        throw error
+    }
+    await checkDestinationDirectory(ancestor, repository)
+  }
 }
 
 /** Merge-copies preflighted entries for {@link backup} and proves both source stability and copied bytes.
@@ -278,8 +367,24 @@ export async function copySource(
 ): Promise<void> {
   for (const [path, entry] of source.entries) {
     signal.throwIfAborted()
-    const origin = join(dirname(source.path), ...path.split('/'))
+    // Manifest destinations are not source paths: only the suffix below the selected root belongs to the origin.
+    if (path !== source.name && !path.startsWith(`${source.name}/`))
+      throw new Error(
+        `Source manifest entry is outside its destination root: ${JSON.stringify(path)}`,
+      )
+    const suffix =
+      path === source.name ? '' : path.slice(source.name.length + 1)
+    const origin = suffix
+      ? join(source.path, ...suffix.split('/'))
+      : source.path
     const destination = join(repository.directory, ...path.split('/'))
+    // Validate the clone root before creating missing parents, including when the root itself was replaced.
+    if ((await realpath(repository.directory)) !== repository.directory)
+      throw new Error(
+        `Destination parent changed or escaped the repository: ${JSON.stringify(path)}`,
+      )
+    await prepareDestinationParents(path, repository, signal)
+    // Root-level selections have no relative ancestors, so always recheck their canonical parent too.
     const parent = await realpath(dirname(destination))
     if (
       !isWithin(repository.directory, parent) ||
@@ -299,13 +404,13 @@ export async function copySource(
         : entry.kind === 'symlink'
           ? !existing.isSymbolicLink()
           : !existing.isFile())
-    ) {
+    )
       throw new Error(
         `Destination entry type changed before copying: ${JSON.stringify(path)}`,
       )
-    }
     if (entry.kind === 'directory') {
-      await mkdir(destination, { recursive: true })
+      if (!existing) await mkdir(destination)
+      await checkDestinationDirectory(path, repository)
     } else {
       // Remove an existing link first: fs.cp otherwise stats dangling link targets on repeated copies.
       if (entry.kind === 'symlink' && existing) await unlink(destination)
@@ -329,7 +434,7 @@ export async function copySource(
         throw new Error(`Copied content changed: ${JSON.stringify(path)}`)
     }
   }
-  const after = await scanSource(source.path, repository, signal)
+  const after = await scanSource(source.path, repository, signal, source.name)
   if (after.entries.size !== source.entries.size)
     throw new Error(
       'Source entries changed during copying. Nothing was pushed.',
@@ -341,11 +446,10 @@ export async function copySource(
       current.signature !== before.signature ||
       current.oid !== before.oid ||
       current.kind !== before.kind
-    ) {
+    )
       throw new Error(
         `Source changed during copying: ${JSON.stringify(path)}. Nothing was pushed.`,
       )
-    }
   }
 }
 

@@ -419,3 +419,182 @@ test('requires explicit registration without a terminal and reports corrupt conf
   expect((await world.cli(['--help'])).stdout).toContain('Usage: backup')
   expect((await world.cli(['--version'])).stdout.trim()).toBe(version)
 })
+
+test.each([
+  'cooking/too.txt',
+  './cooking/too.txt',
+  'cooking//recipes/../too.txt',
+])(
+  'backs up only the selected nested file without copying siblings (%j)',
+  async (input) => {
+    // Arrange
+    const world = await createWorld()
+    await put(join(world.source, 'cooking', 'too.txt'), 'selected recipe\n')
+    await put(join(world.source, 'cooking', 'other.txt'), 'not selected\n')
+    // Act
+    const result = await world.cli(['--repo', world.repo, input])
+    const restored = await recover(world)
+    // Assert
+    expect(result.stdout).toContain('"cooking/too.txt"')
+    expect(
+      (
+        await world.git(['log', '-1', '--format=%s'], world.remote)
+      ).stdout.trim(),
+    ).toBe('chore(backup): update cooking/too.txt')
+    expect(
+      (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+        .stdout,
+    ).toBe('cooking/too.txt\n')
+    expect(await readFile(join(restored, 'cooking', 'too.txt'), 'utf8')).toBe(
+      'selected recipe\n',
+    )
+  },
+)
+
+test('creates every missing parent for a deeply selected file', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(
+    join(world.source, 'cooking', 'recipes', 'dinner.txt'),
+    'deep recipe\n',
+  )
+  await put(
+    join(world.source, 'cooking', 'recipes', 'other.txt'),
+    'not selected\n',
+  )
+  // Act
+  await world.cli(['--repo', world.repo, 'cooking/recipes/dinner.txt'])
+  // Assert
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe('cooking/recipes/dinner.txt\n')
+  expect(
+    await readFile(
+      join(world.repo, 'cooking', 'recipes', 'dinner.txt'),
+      'utf8',
+    ),
+  ).toBe('deep recipe\n')
+})
+
+test('backs up a nested directory recursively while retaining its full selected hierarchy', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.source, 'cooking', 'recipes', 'dinner.txt'), 'dinner\n')
+  await put(
+    join(world.source, 'cooking', 'recipes', 'dessert', 'cake.txt'),
+    'cake\n',
+  )
+  await put(join(world.source, 'cooking', 'other.txt'), 'not selected\n')
+  await put(
+    join(world.source, 'cooking', 'recipes', '.git', 'config'),
+    'excluded metadata\n',
+  )
+  // Act
+  await world.cli(['--repo', world.repo, 'cooking/recipes'])
+  // Assert
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe('cooking/recipes/dessert/cake.txt\ncooking/recipes/dinner.txt\n')
+  expect(
+    await readFile(
+      join(world.repo, 'cooking', 'recipes', 'dessert', 'cake.txt'),
+      'utf8',
+    ),
+  ).toBe('cake\n')
+})
+
+test('maps literal tilde and shell-expanded absolute sources identically from outside home', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.home, 'cooking', 'too.txt'), 'home recipe\n')
+  // Act
+  await world.cli(['--repo', world.repo, '~/cooking/too.txt'])
+  const repeated = await world.cli([join(world.home, 'cooking', 'too.txt')])
+  // Assert
+  expect(repeated.stdout).toContain('Unchanged: "cooking/too.txt"')
+  expect(
+    (
+      await world.git(['rev-list', '--count', 'main'], world.remote)
+    ).stdout.trim(),
+  ).toBe('1')
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe('cooking/too.txt\n')
+  expect(await readFile(join(world.repo, 'cooking', 'too.txt'), 'utf8')).toBe(
+    'home recipe\n',
+  )
+})
+
+test('updates only the mapped file and retains old flattened copies and unrelated committed siblings', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, 'too.txt'), 'old flattened copy\n')
+  await put(join(world.repo, 'cooking', 'retained.txt'), 'retained sibling\n')
+  await world.commit()
+  await put(join(world.source, 'cooking', 'too.txt'), 'first recipe\n')
+  await world.cli(['--repo', world.repo, 'cooking/too.txt'])
+  // Act
+  await put(join(world.source, 'cooking', 'too.txt'), 'updated recipe\n')
+  await world.cli(['cooking/too.txt'])
+  const repeated = await world.cli(['cooking/too.txt'])
+  // Assert
+  expect(repeated.stdout).toContain('Unchanged')
+  expect(
+    (
+      await world.git(['rev-list', '--count', 'main'], world.remote)
+    ).stdout.trim(),
+  ).toBe('3')
+  expect(await readFile(join(world.repo, 'too.txt'), 'utf8')).toBe(
+    'old flattened copy\n',
+  )
+  expect(
+    await readFile(join(world.repo, 'cooking', 'retained.txt'), 'utf8'),
+  ).toBe('retained sibling\n')
+  expect(await readFile(join(world.repo, 'cooking', 'too.txt'), 'utf8')).toBe(
+    'updated recipe\n',
+  )
+})
+
+test('backs up a source-parent alias into unrelated Git metadata without changing its approved destination', async () => {
+  // Arrange
+  const world = await createWorld()
+  const unrelated = join(world.root, 'unrelated')
+  await world.git(['init', unrelated])
+  await put(
+    join(unrelated, '.git', 'too.txt'),
+    'selected through parent alias\n',
+  )
+  await symlink(join(unrelated, '.git'), join(world.source, 'cooking'), 'dir')
+  // Act
+  await world.cli(['--repo', world.repo, 'cooking/too.txt'])
+  // Assert
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe('cooking/too.txt\n')
+  expect(
+    (await world.git(['show', 'main:cooking/too.txt'], world.remote)).stdout,
+  ).toBe('selected through parent alias\n')
+})
+
+test('keeps redundant home-prefix separators equivalent to the home-contained absolute source', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.home, 'cooking', 'too.txt'), 'home separators\n')
+  // Act
+  await world.cli(['--repo', world.repo, '~//cooking/too.txt'])
+  const repeated = await world.cli([join(world.home, 'cooking', 'too.txt')])
+  // Assert
+  expect(repeated.stdout).toContain('Unchanged: "cooking/too.txt"')
+  expect(
+    (await world.git(['show', 'main:cooking/too.txt'], world.remote)).stdout,
+  ).toBe('home separators\n')
+  expect(
+    (
+      await world.git(['rev-list', '--count', 'main'], world.remote)
+    ).stdout.trim(),
+  ).toBe('1')
+})
