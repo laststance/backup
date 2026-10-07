@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0.0] - 2026-10-07
+
+### Changed
+
+- Preserve the hierarchy of relative sources: `backup cooking/too.txt` now saves only that file at `cooking/too.txt`, creating missing parent directories. Directory sources continue to copy recursively at their selected path.
+- Preserve home-relative paths for `~/…` and absolute sources inside the user's home. Absolute sources outside home retain basename-only copying.
+- Keep previously flattened backups in place when a later backup creates the new nested path. No automatic moves or deletions occur.
+
+### Fixed
+
+- Treat redundant separators after `~/` as home-relative and preserve literal backslashes in POSIX filenames.
+- Accept fully absolute and home-relative sources even if the invocation directory has been removed.
+
+### Security
+
+- Validate all destination ancestors before creating directories or copying selected files, including symlink, submodule, metadata, and tracked-path conflicts.
+- Reject relative paths that escape the invocation directory and ambiguous Windows drive-relative paths. Use an absolute or home-relative source when selecting files outside the invocation directory.
+
 ## [0.1.1.0] - 2026-10-03
 
 ### Fixed
