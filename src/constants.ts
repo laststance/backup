@@ -10,3 +10,7 @@ export const MIN_GIT_MAJOR_VERSION = 2
 export const MIN_GIT_MINOR_VERSION = 31
 export const INTERRUPTED_EXIT_CODE = 130
 export const TERMINATED_EXIT_CODE = 143
+export const MANIFEST_VERSION = 1
+/** Entries changed this recently are rehashed: coarse timestamps or clock skew could hide a same-tick rewrite. */
+export const MANIFEST_RACY_WINDOW_MS = 10_000
+export const NANOSECONDS_PER_MILLISECOND = 1_000_000n

@@ -13,11 +13,19 @@ import { basename, dirname, join } from 'node:path'
 import type { BigIntStats } from 'node:fs'
 import type { Repository } from './git'
 import { git } from './git'
-import { EXECUTABLE_MODE_MASK, MAX_FILE_SIZE_BYTES } from './constants'
+import {
+  EXECUTABLE_MODE_MASK,
+  MAX_FILE_SIZE_BYTES,
+  NANOSECONDS_PER_MILLISECOND,
+} from './constants'
+import { readManifest, settledBlobs } from './manifest'
+import type { KnownBlob } from './manifest'
 import { isWithin } from './utils/is-within'
 import { maybeLstat } from './utils/maybe-lstat'
 import { readNulRecords } from './utils/read-nul-records'
 import { metadataAlias } from './utils/metadata-alias'
+import { parseStageRecord } from './utils/parse-stage-record'
+import type { StageRecord } from './utils/parse-stage-record'
 import { resolveBackupPath } from './utils/resolve-backup-path'
 
 export type Entry = {
@@ -25,6 +33,8 @@ export type Entry = {
   mode: string
   oid: string
   signature: string
+  /** Latest of mtime and ctime; decides whether equal metadata may later stand in for rereading the bytes. */
+  changedAtNs: bigint
 }
 export type Source = {
   /** Source location with a canonical parent, retaining a selected leaf symlink. */
@@ -32,6 +42,8 @@ export type Source = {
   /** Preserved repository-relative destination root, shared by all manifest keys. */
   name: string
   entries: Map<string, Entry>
+  /** Wall-clock start of the scan, the reference point for {@link settledBlobs}. */
+  scannedAtNs: bigint
 }
 
 /** Captures metadata for {@link scanSource} to detect replacement or writes while bytes are read.
@@ -55,27 +67,45 @@ function signature(stats: BigIntStats): string {
  * @param stats - Entry metadata observed before reading.
  * @param repository - Supplies Git's object hash algorithm.
  * @param signal - CLI cancellation signal.
+ * @param knownBlob - Settled ID from {@link readManifest} or the pre-copy scan; trusted only for an identical signature.
  * @returns The exact Git blob ID and entry mode expected in the index.
- * @example await readEntry(path, stats, repository, signal)
+ * @example await readEntry(path, stats, repository, signal, knownBlobs.get('notes/a.md'))
  */
 async function readEntry(
   path: string,
   stats: BigIntStats,
   repository: Repository,
   signal: AbortSignal,
+  knownBlob?: KnownBlob,
 ): Promise<Entry> {
   signal.throwIfAborted()
   const marker = signature(stats)
+  const changedAtNs =
+    stats.mtimeNs > stats.ctimeNs ? stats.mtimeNs : stats.ctimeNs
   if (stats.isDirectory())
-    return { kind: 'directory', mode: '040000', oid: '', signature: marker }
+    return {
+      kind: 'directory',
+      mode: '040000',
+      oid: '',
+      signature: marker,
+      changedAtNs,
+    }
   if (!stats.isFile() && !stats.isSymbolicLink())
     throw new Error(`Unsupported filesystem entry: ${JSON.stringify(path)}`)
   if (stats.size > MAX_FILE_SIZE_BYTES)
     throw new Error(`File exceeds 100 MiB: ${JSON.stringify(path)}`)
+  const kind: Entry['kind'] = stats.isSymbolicLink() ? 'symlink' : 'file'
+  const mode =
+    kind === 'symlink'
+      ? '120000'
+      : Number(stats.mode) & EXECUTABLE_MODE_MASK
+        ? '100755'
+        : '100644'
+  // Settled entries with identical inode, size, mode, mtime, and ctime reuse the recorded ID without rereading.
+  if (knownBlob?.signature === marker)
+    return { kind, mode, oid: knownBlob.oid, signature: marker, changedAtNs }
   const hash = createHash(repository.objectFormat)
-  let mode: string
-  let kind: Entry['kind']
-  if (stats.isSymbolicLink()) {
+  if (kind === 'symlink') {
     const target = await readlink(path, { encoding: 'buffer' })
     // Reject undecodable link text instead of silently changing its bytes during copy.
     const targetText = new TextDecoder('utf-8', {
@@ -88,25 +118,22 @@ async function readEntry(
         ? Buffer.from(targetText.replaceAll('\\', '/'))
         : target
     hash.update(`blob ${gitTarget.length}\0`).update(gitTarget)
-    mode = '120000'
-    kind = 'symlink'
   } else {
     hash.update(`blob ${stats.size}\0`)
     for await (const chunk of createReadStream(path, { signal }))
       hash.update(chunk)
-    mode = Number(stats.mode) & EXECUTABLE_MODE_MASK ? '100755' : '100644'
-    kind = 'file'
   }
   if (signature(await lstat(path, { bigint: true })) !== marker)
     throw new Error(`Source changed while being read: ${JSON.stringify(path)}`)
-  return { kind, mode, oid: hash.digest('hex'), signature: marker }
+  return { kind, mode, oid: hash.digest('hex'), signature: marker, changedAtNs }
 }
 
 /** Builds the complete source manifest before {@link backup} writes anything, excluding exact .git components.
+ * Entries whose metadata matches the persisted manifest from {@link readManifest} reuse its blob IDs instead of rereading bytes.
  * @param input - One source file, directory, or symlink.
  * @param repository - Destination root and protected metadata directories.
  * @param signal - CLI cancellation signal.
- * @param destinationName - Previously validated mapping reused by {@link copySource} during its stability rescan.
+ * @param destinationName - Pre-approved destination root that bypasses {@link resolveBackupPath}; callers pass it to pin the mapping.
  * @returns Canonical source parent, mapped destination root, and byte/type manifest.
  * @example await scanSource("./notes", repository, signal)
  */
@@ -116,14 +143,14 @@ export async function scanSource(
   signal: AbortSignal,
   destinationName?: string,
 ): Promise<Source> {
-  // Internal rescans reuse the approved location and mapping; canonical parent aliases are not fresh CLI input.
+  // A pre-approved mapping keeps its location as given; canonical parent aliases are not fresh CLI input.
   const mapping =
     destinationName === undefined
       ? resolveBackupPath(input)
       : { path: input, name: destinationName }
   const resolved = mapping.path
   const name = mapping.name
-  // A rescan preserves its original mapping, while still rejecting invalid internal keys.
+  // A pre-approved mapping is kept as given, while still rejecting invalid internal keys.
   if (
     name
       .split('/')
@@ -144,6 +171,28 @@ export async function scanSource(
       'Source and destination/metadata directories must not overlap.',
     )
   }
+  const scannedAtNs = BigInt(Date.now()) * NANOSECONDS_PER_MILLISECOND
+  const knownBlobs = await readManifest(repository, path, name)
+  const entries = await walkSource(path, name, repository, signal, knownBlobs)
+  return { path, name, entries, scannedAtNs }
+}
+
+/** Walks one source tree for {@link scanSource} and the {@link copySource} stability rescan, excluding exact .git components.
+ * @param path - Canonical source location.
+ * @param name - Repository-relative destination root used as the key prefix.
+ * @param repository - Supplies Git's object hash algorithm.
+ * @param signal - CLI cancellation signal.
+ * @param knownBlobs - Settled IDs reused for entries whose signature is unchanged; others are reread.
+ * @returns Every entry keyed by destination path, parents before their children.
+ * @example await walkSource('/home/me/notes', 'notes', repository, signal, new Map()) // => Map { 'notes' => {...}, 'notes/a.md' => {...} }
+ */
+async function walkSource(
+  path: string,
+  name: string,
+  repository: Repository,
+  signal: AbortSignal,
+  knownBlobs: ReadonlyMap<string, KnownBlob>,
+): Promise<Map<string, Entry>> {
   const entries = new Map<string, Entry>()
   const visit = async (
     absolutePath: string,
@@ -153,7 +202,13 @@ export async function scanSource(
     const stats = await lstat(absolutePath, { bigint: true })
     entries.set(
       relativePath,
-      await readEntry(absolutePath, stats, repository, signal),
+      await readEntry(
+        absolutePath,
+        stats,
+        repository,
+        signal,
+        knownBlobs.get(relativePath),
+      ),
     )
     if (!stats.isDirectory()) return
     for (const child of await readdir(absolutePath, {
@@ -174,7 +229,7 @@ export async function scanSource(
     }
   }
   await visit(path, name)
-  return { path, name, entries }
+  return entries
 }
 
 /** Lists the ordered parents needed by {@link validateDestination} and {@link copySource} without selecting siblings.
@@ -289,8 +344,7 @@ export async function validateDestination(
   await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
-        const separator = record.indexOf('\t')
-        const path = record.slice(separator + 1)
+        const { mode, path } = parseStageRecord(record)
         // Every tracked prefix participates, including parents of unrelated tracked siblings.
         for (const prefix of [...destinationAncestors(path), path]) {
           const target = required.get(canonicalKey(prefix))
@@ -299,7 +353,7 @@ export async function validateDestination(
             target.path !== prefix ||
             (prefix !== path && target.kind !== 'directory') ||
             (prefix === path &&
-              (record.startsWith('160000 ') || target.kind === 'directory'))
+              (mode === '160000' || target.kind === 'directory'))
           )
             throw new Error(
               `Tracked path collision or submodule: ${JSON.stringify(path)}`,
@@ -353,7 +407,55 @@ async function prepareDestinationParents(
   }
 }
 
+/** Rejects a clone root replaced after preflight, before {@link copySource} reads its index or writes beneath it.
+ * @param path - Selected destination key named in the error.
+ * @param repository - Clone whose canonical root was resolved at startup.
+ * @returns Resolves only while the root path still resolves to itself.
+ * @throws When the root became a symlink or now resolves elsewhere.
+ * @example await assertCloneRoot('cooking/too.txt', repository)
+ */
+async function assertCloneRoot(
+  path: string,
+  repository: Repository,
+): Promise<void> {
+  if ((await realpath(repository.directory)) !== repository.directory)
+    throw new Error(
+      `Destination parent changed or escaped the repository: ${JSON.stringify(path)}`,
+    )
+}
+
+/** Reads the index entries under the selected root so {@link copySource} and {@link stageSource} leave already-backed-up files untouched.
+ * @param source - Manifest whose destination root limits the listing.
+ * @param repository - Clean, locked destination clone.
+ * @param signal - CLI cancellation signal.
+ * @returns Unconflicted (stage 0) index records of selected paths, keyed by path.
+ * @example (await readIndexedBlobs(source, repository, signal)).get('notes/a.md') // => { mode: '100644', oid: '...', stage: '0', path: 'notes/a.md' }
+ */
+async function readIndexedBlobs(
+  source: Source,
+  repository: Repository,
+  signal: AbortSignal,
+): Promise<Map<string, StageRecord>> {
+  const indexedBlobs = new Map<string, StageRecord>()
+  await git(
+    repository.directory,
+    ['ls-files', '--stage', '-z', '--', source.name],
+    signal,
+    {
+      consume: async (output) => {
+        for await (const record of readNulRecords(output)) {
+          const indexed = parseStageRecord(record)
+          if (indexed.stage === '0' && source.entries.has(indexed.path))
+            indexedBlobs.set(indexed.path, indexed)
+        }
+      },
+    },
+  )
+  return indexedBlobs
+}
+
 /** Merge-copies preflighted entries for {@link backup} and proves both source stability and copied bytes.
+ * Files and symlinks already staged with the same blob ID and mode are skipped; {@link stageSource} still verifies them.
  * @param source - Manifest checked before the first write.
  * @param repository - Clean, locked repository with validated destination paths.
  * @param signal - CLI cancellation signal.
@@ -365,6 +467,9 @@ export async function copySource(
   repository: Repository,
   signal: AbortSignal,
 ): Promise<void> {
+  // Read the index only from the validated clone, never from a directory substituted at its path.
+  await assertCloneRoot(source.name, repository)
+  const indexedBlobs = await readIndexedBlobs(source, repository, signal)
   for (const [path, entry] of source.entries) {
     signal.throwIfAborted()
     // Manifest destinations are not source paths: only the suffix below the selected root belongs to the origin.
@@ -372,6 +477,9 @@ export async function copySource(
       throw new Error(
         `Source manifest entry is outside its destination root: ${JSON.stringify(path)}`,
       )
+    const indexed = indexedBlobs.get(path)
+    // The clean worktree already holds these exact bytes; skipping writes nothing through a possibly swapped parent.
+    if (indexed?.oid === entry.oid && indexed.mode === entry.mode) continue
     const suffix =
       path === source.name ? '' : path.slice(source.name.length + 1)
     const origin = suffix
@@ -379,10 +487,7 @@ export async function copySource(
       : source.path
     const destination = join(repository.directory, ...path.split('/'))
     // Validate the clone root before creating missing parents, including when the root itself was replaced.
-    if ((await realpath(repository.directory)) !== repository.directory)
-      throw new Error(
-        `Destination parent changed or escaped the repository: ${JSON.stringify(path)}`,
-      )
+    await assertCloneRoot(path, repository)
     await prepareDestinationParents(path, repository, signal)
     // Root-level selections have no relative ancestors, so always recheck their canonical parent too.
     const parent = await realpath(dirname(destination))
@@ -434,13 +539,20 @@ export async function copySource(
         throw new Error(`Copied content changed: ${JSON.stringify(path)}`)
     }
   }
-  const after = await scanSource(source.path, repository, signal, source.name)
-  if (after.entries.size !== source.entries.size)
+  // Settled entries with unchanged metadata keep their scanned IDs; recently changed ones are reread.
+  const after = await walkSource(
+    source.path,
+    source.name,
+    repository,
+    signal,
+    settledBlobs(source),
+  )
+  if (after.size !== source.entries.size)
     throw new Error(
       'Source entries changed during copying. Nothing was pushed.',
     )
   for (const [path, before] of source.entries) {
-    const current = after.entries.get(path)
+    const current = after.get(path)
     if (
       !current ||
       current.signature !== before.signature ||
@@ -454,6 +566,7 @@ export async function copySource(
 }
 
 /** Streams exact selected paths into Git and checks staged blob IDs/types for {@link backup} before commit.
+ * Paths already staged with the expected blob ID and mode are not re-added, but every selected path is still verified.
  * @param source - Original source byte/type manifest.
  * @param repository - Destination working tree after copying.
  * @param signal - CLI cancellation signal.
@@ -469,6 +582,7 @@ export async function stageSource(
     [...source.entries].filter(([, entry]) => entry.kind !== 'directory'),
   )
   if (files.size) {
+    const indexedBlobs = await readIndexedBlobs(source, repository, signal)
     const fileMode = await git(
       repository.directory,
       ['config', '--bool', '--default', 'true', 'core.fileMode'],
@@ -477,45 +591,43 @@ export async function stageSource(
     // Git retains tracked modes and gives new files 100644 when filesystem executable bits are ignored.
     if (fileMode.stdout.trim() === 'false') {
       for (const [path, entry] of files) {
-        if (entry.kind === 'file') files.set(path, { ...entry, mode: '100644' })
+        if (entry.kind !== 'file') continue
+        const indexedMode = indexedBlobs.get(path)?.mode
+        files.set(path, {
+          ...entry,
+          mode:
+            indexedMode === '100644' || indexedMode === '100755'
+              ? indexedMode
+              : '100644',
+        })
       }
-      await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
-        consume: async (output) => {
-          for await (const record of readNulRecords(output)) {
-            const separator = record.indexOf('\t')
-            const path = record.slice(separator + 1)
-            const entry = files.get(path)
-            const [mode, , stage] = record.slice(0, separator).split(' ')
-            if (
-              entry?.kind === 'file' &&
-              stage === '0' &&
-              (mode === '100644' || mode === '100755')
-            )
-              files.set(path, { ...entry, mode })
-          }
-        },
-      })
     }
-    await git(
-      repository.directory,
-      ['add', '--force', '--pathspec-from-file=-', '--pathspec-file-nul'],
-      signal,
-      {
-        input: (function* () {
-          for (const path of files.keys()) yield `${path}\0`
-        })(),
-      },
-    )
+    // Add only paths whose staged blob or mode differs: Git's pathspec matching grows with the path count.
+    const unstagedPaths = [...files]
+      .filter(([path, entry]) => {
+        const indexed = indexedBlobs.get(path)
+        return indexed?.oid !== entry.oid || indexed.mode !== entry.mode
+      })
+      .map(([path]) => path)
+    if (unstagedPaths.length)
+      await git(
+        repository.directory,
+        ['add', '--force', '--pathspec-from-file=-', '--pathspec-file-nul'],
+        signal,
+        {
+          input: (function* () {
+            for (const path of unstagedPaths) yield `${path}\0`
+          })(),
+        },
+      )
   }
   let matched = 0
   await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
-        const separator = record.indexOf('\t')
-        const path = record.slice(separator + 1)
+        const { mode, oid, stage, path } = parseStageRecord(record)
         const entry = files.get(path)
         if (!entry) continue
-        const [mode, oid, stage] = record.slice(0, separator).split(' ')
         if (mode !== entry.mode || oid !== entry.oid || stage !== '0') {
           throw new Error(
             `Git changed the selected bytes or entry type: ${JSON.stringify(path)}. Inspect .gitattributes, filters, and index flags; nothing was pushed.`,

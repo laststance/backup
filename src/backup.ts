@@ -26,6 +26,7 @@ import {
   stageSource,
   validateDestination,
 } from './filetree'
+import { writeManifest } from './manifest'
 
 /** Serializes CLI calls across linked worktrees for {@link backup}, leaving stale locks for explicit recovery.
  * @param repository - Resolved common Git directory shared by worktrees.
@@ -144,6 +145,14 @@ export async function backup(
     const originalHead = await headCommit(repository, signal)
     phase = 'preflight'
     const source = await scanSource(options.source, repository, signal)
+    // Record IDs proven by this scan even if a later check fails, so the retry rereads only changed entries.
+    // The manifest only saves rereads: a failed write costs the next run a full rehash, never this backup.
+    await writeManifest(source, repository).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error)
+      console.warn(
+        `Warning: could not update the backup manifest; the next run rereads every file. ${detail}`,
+      )
+    })
     await validateDestination(source, repository, signal)
     affectedPath = join(repository.directory, source.name)
     if ((await headCommit(repository, signal)) !== originalHead)
