@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0.0] - 2026-11-03
+
+### Changed
+
+- Repeat a backup of a large directory in seconds. Unchanged files are recognized from their recorded inode, size, mode, mtime, and ctime, so they are neither reread nor recopied: 20,000 files (320 MB) that took 25–146 s to recheck now finish in about 2 s.
+- Leave files already committed with the same bytes and mode untouched in the clone instead of rewriting them on every run.
+- Keep those records in `<git-common-dir>/laststance-backup-manifests/`, never in the backed-up content. A missing or corrupt record triggers a full recheck, a record that cannot be written prints a warning without stopping the backup, and deleting the directory forces a full recheck.
+- Like rsync's quick check, a content change that keeps all of that metadata identical is not detected. Files changed within 10 seconds of a scan are always reread.
+
 ## [0.2.0.0] - 2026-10-07
 
 ### Changed
