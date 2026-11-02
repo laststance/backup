@@ -1,4 +1,4 @@
-import { afterAll, beforeAll } from 'bun:test'
+import { afterAll, beforeAll, setDefaultTimeout } from 'bun:test'
 import {
   chmod,
   cp,
@@ -20,10 +20,15 @@ export const nodePath = (
 const fixtureRoot = await mkdtemp(join(tmpdir(), 'backup-test-tools-'))
 const roots: string[] = []
 
-/** Installs and cleans shared executable fixtures per test file because Bun scopes lifecycle hooks to that file.
+/** Real-Git CLI tests spawn many processes; Bun's 5 s default times out their hooks on loaded or Windows runners. */
+const TEST_TIMEOUT_MS = 30_000
+
+/** Installs and cleans shared executable fixtures, and sets the suite timeout, per test file because Bun scopes both to that file.
  * @example useFixtures(); test("backs up a file", async () => { const world = await createWorld(); });
  */
 export function useFixtures(): void {
+  // Bun resets the default timeout for every test file, so a preload or CLI-free run cannot set it once.
+  setDefaultTimeout(TEST_TIMEOUT_MS)
   beforeAll(async () => {
     await mkdir(fixtureRoot, { recursive: true })
     const fixture = fileURLToPath(new URL('./fixtures/gh.mjs', import.meta.url))
