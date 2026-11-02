@@ -1,15 +1,10 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
-import { randomUUID } from 'node:crypto'
-import {
-  CONFIG_VERSION,
-  MAX_COMMAND_OUTPUT_BYTES,
-  PRIVATE_DIRECTORY_MODE,
-  PRIVATE_FILE_MODE,
-} from './constants'
+import { isAbsolute, join } from 'node:path'
+import { CONFIG_VERSION, MAX_COMMAND_OUTPUT_BYTES } from './constants'
 import { isGitHubName } from './utils/github-name'
 import { maybeLstat } from './utils/maybe-lstat'
+import { writePrivateFileAtomically } from './utils/write-private-file-atomically'
 
 export type BackupConfig = {
   version: typeof CONFIG_VERSION
@@ -82,17 +77,8 @@ export async function loadConfig(): Promise<BackupConfig | undefined> {
  * @example await saveConfig(validatedDestination)
  */
 export async function saveConfig(config: BackupConfig): Promise<void> {
-  const path = configPath()
-  await mkdir(dirname(path), { recursive: true, mode: PRIVATE_DIRECTORY_MODE })
-  const temporaryPath = `${path}.${randomUUID()}.tmp`
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, {
-      flag: 'wx',
-      mode: PRIVATE_FILE_MODE,
-    })
-    await rename(temporaryPath, path)
-  } finally {
-    // Remove only the temporary file belonging to this attempted write.
-    await rm(temporaryPath, { force: true })
-  }
+  await writePrivateFileAtomically(
+    configPath(),
+    `${JSON.stringify(config, null, 2)}\n`,
+  )
 }
