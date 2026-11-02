@@ -211,14 +211,14 @@ async function walkSource(
       ),
     )
     if (!stats.isDirectory()) return
-    for (const child of await readdir(absolutePath, {
+    // Plain buffer names: each child is lstat-ed by visit, and Bun's buffer Dirents carry no name.
+    for (const childBytes of await readdir(absolutePath, {
       encoding: 'buffer',
-      withFileTypes: true,
     })) {
       const childName = new TextDecoder('utf-8', {
         fatal: true,
         ignoreBOM: true,
-      }).decode(child.name)
+      }).decode(childBytes)
       // Ordinary .git is excluded; aliases reject the entire operation before any copy.
       if (childName === '.git') continue
       if (metadataAlias(childName))
