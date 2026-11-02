@@ -1,0 +1,3 @@
+[test]
+# Makes a bare `bun test` match `bun run check`: dist/cli.js is rebuilt before any test spawns it.
+preload = ["./test/setup.ts"]

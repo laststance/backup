@@ -23,8 +23,6 @@ import { writePrivateFileAtomically } from '../src/utils/write-private-file-atom
 
 useFixtures()
 
-// Direct scans select single files: Bun's buffer-encoded readdir omits Dirent names, unlike the Node runtime the CLI uses.
-
 afterEach(() => {
   setSystemTime()
 })
@@ -33,6 +31,32 @@ afterEach(() => {
 const settleFixtureTimestamps = () => {
   setSystemTime(new Date(Date.now() + 60_000))
 }
+
+test('lists every nested entry when a source directory is scanned in-process', async () => {
+  // Value: protects=directory scans finish under Bun as well as Node; fails_when=walkSource reads names from Bun's nameless buffer Dirents and revisits the same directory forever; why_new=earlier direct scans selected single files to dodge the hang; seam=none; no_claim=readdir ordering
+  // Arrange
+  const world = await createWorld()
+  const signal = new AbortController().signal
+  const repository = await readRepository(world.repo, signal)
+  await put(join(world.source, 'notes', 'a.md'), 'a\n')
+  await put(join(world.source, 'notes', 'deep', 'b.md'), 'b\n')
+
+  // Act
+  const source = await scanSource(
+    join(world.source, 'notes'),
+    repository,
+    signal,
+    'notes',
+  )
+
+  // Assert
+  expect([...source.entries.keys()].sort()).toEqual([
+    'notes',
+    'notes/a.md',
+    'notes/deep',
+    'notes/deep/b.md',
+  ])
+})
 
 test('rewrites only changed files when a directory is backed up again', async () => {
   // Arrange

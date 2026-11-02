@@ -105,10 +105,11 @@ Ctrl-C releases this invocation's lock after cancellation on Unix. A hard kill/c
 bun install --frozen-lockfile
 bun run check
 bun run dev -- --help
+bun run bench -- --files 2000
 npm pack
 ```
 
-Bun builds TypeScript into one Node ESM CLI with no npm runtime dependencies. `prepack` builds the distributable. `bun run check` runs type checking, build, real-Git behavior tests, and an isolated npm tarball installation/Node/recovery test. CI is configured to run the same suite on macOS, Linux, and Windows; POSIX signal, permission, and terminal tests are Unix-only. Terminal tests use Python 3's standard-library PTY module on Unix. The large-tree test covers 10,000 paths totaling over 2 MiB, and streamed output is tested with a slow consumer.
+Bun builds TypeScript into one Node ESM CLI with no npm runtime dependencies. `prepack` builds the distributable. `bun run check` runs type checking, build, real-Git behavior tests, and an isolated npm tarball installation/Node/recovery test. Tests run the built `dist/cli.js`; `bunfig.toml` preloads `test/setup.ts`, which rebuilds it, and `useFixtures()` sets each CLI test file's 30-second timeout, so a bare `bun test` or a single-file run matches `bun run check`. `bun run bench` measures initial, unchanged, and five-file-changed backups of a generated tree on macOS or Linux (`--files`, `--bytes`, and `--cli <bundle>` to compare builds; defaults are the 20,000 × 16 KiB tree behind the 0.3.0 figures). CI is configured to run the same suite on macOS, Linux, and Windows; POSIX signal, permission, and terminal tests are Unix-only. Terminal tests use Python 3's standard-library PTY module on Unix. The large-tree test covers 10,000 paths totaling over 2 MiB, and streamed output is tested with a slow consumer.
 
 ## Release
 
