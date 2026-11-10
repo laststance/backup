@@ -1,12 +1,18 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import {
+  appendFile,
+  copyFile,
   cp,
+  link,
   lstat,
   mkdir,
   readdir,
+  readFile,
   readlink,
   realpath,
+  rename,
+  symlink,
   unlink,
 } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
@@ -607,6 +613,207 @@ export async function copySource(
   }
 }
 
+/**
+ * Separates index names the scan no longer contains into files to delete and names that are the same directory entry as a kept file.
+ *
+ * Volumes such as APFS store one entry for some distinct Unicode names. Deleting the old name would delete the file {@link copySource} just wrote under the source name.
+ *
+ * @param source - Scan whose files and symlinks must remain in the clone.
+ * @param repository - Destination working tree after copying.
+ * @param removals - Index spellings from {@link validateDestination}.
+ * @param signal - CLI cancellation signal.
+ * @returns Paths to unlink, paths to drop from the index only, and source paths that share an inode with an index-only name.
+ */
+async function classifyRemovals(
+  source: Source,
+  repository: Repository,
+  removals: ReadonlySet<string>,
+  signal: AbortSignal,
+): Promise<{ unlink: string[]; indexOnly: string[]; aliases: string[] }> {
+  const keptInodes = new Map<string, string>()
+  for (const [path, entry] of source.entries) {
+    if (entry.kind === 'directory') continue
+    signal.throwIfAborted()
+    const stats = await maybeLstat(
+      join(repository.directory, ...path.split('/')),
+    )
+    if (!stats) continue
+    keptInodes.set(`${stats.dev}:${stats.ino}`, path)
+  }
+  const unlink: string[] = []
+  const indexOnly: string[] = []
+  const aliases = new Set<string>()
+  const unlinkedInodes = new Set<string>()
+  for (const path of removals) {
+    signal.throwIfAborted()
+    const stats = await maybeLstat(
+      join(repository.directory, ...path.split('/')),
+    )
+    if (!stats) {
+      unlink.push(path)
+      continue
+    }
+    const inode = `${stats.dev}:${stats.ino}`
+    const kept = keptInodes.get(inode)
+    // A second index name for a file already chosen for deletion must not unlink it again.
+    if (kept || unlinkedInodes.has(inode)) {
+      indexOnly.push(path)
+      if (kept) aliases.add(kept)
+      continue
+    }
+    unlink.push(path)
+    unlinkedInodes.add(inode)
+  }
+  return { unlink, indexOnly, aliases: [...aliases] }
+}
+
+/**
+ * Gives a kept file the source spelling before its old index name is removed.
+ *
+ * The directory entry otherwise keeps the first spelling the volume stored. `git rm` of the old index name then deletes the file, and `git status` stays dirty if the index spelling and the directory entry disagree.
+ *
+ * @param repository - Destination working tree.
+ * @param kept - Source path that shares its inode with a removal.
+ * @param signal - CLI cancellation signal.
+ */
+async function retitleKeptFile(
+  repository: Repository,
+  kept: string,
+  signal: AbortSignal,
+): Promise<void> {
+  signal.throwIfAborted()
+  const destination = join(repository.directory, ...kept.split('/'))
+  const stats = await maybeLstat(destination)
+  if (!stats) return
+  const parent = dirname(destination)
+  let catalog: string | undefined
+  for (const name of await readdir(parent)) {
+    const entry = await maybeLstat(join(parent, name))
+    if (entry && entry.dev === stats.dev && entry.ino === stats.ino) {
+      catalog = name
+      break
+    }
+  }
+  if (!catalog || catalog === basename(destination)) return
+  const from = join(parent, catalog)
+  const temporary = join(
+    parent,
+    `.backup-name-${randomBytes(8).toString('hex')}`,
+  )
+  if (stats.isSymbolicLink()) {
+    await symlink(await readlink(from), temporary)
+  } else {
+    try {
+      // Some filesystems reject a hard link. The temporary copy still preserves the bytes.
+      await link(from, temporary)
+    } catch {
+      await copyFile(from, temporary)
+    }
+  }
+  try {
+    await unlink(from)
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined)
+    throw error
+  }
+  try {
+    await rename(temporary, destination)
+  } catch (error) {
+    await rename(temporary, from).catch(() => undefined)
+    throw error
+  }
+}
+
+/**
+ * Reads porcelain paths with one status marker for {@link stageSource}.
+ *
+ * @param repository - Destination working tree.
+ * @param signal - CLI cancellation signal.
+ * @param marker - `!!` for ignored paths, or `??` for untracked paths.
+ * @returns Repository-relative paths Git reported with that marker.
+ */
+async function pathsWithStatus(
+  repository: Repository,
+  signal: AbortSignal,
+  marker: '!!' | '??',
+): Promise<Set<string>> {
+  const paths = new Set<string>()
+  await git(
+    repository.directory,
+    [
+      'status',
+      ...(marker === '!!' ? ['--ignored'] : []),
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+    ],
+    signal,
+    {
+      consume: async (output) => {
+        for await (const record of readNulRecords(output)) {
+          if (!record.startsWith(`${marker} `)) continue
+          paths.add(record.slice(3))
+        }
+      },
+    },
+  )
+  return paths
+}
+
+/**
+ * Records ignored files that become untracked when their ignore rule is deleted.
+ *
+ * {@link assertClean} rejects any untracked file, including one that was ignored until this backup removed the tracked ignore file. A local exclude keeps the file on disk without putting it in the backup, and a later run stays clean. `git add --force` still stages the file if a later backup selects it.
+ *
+ * @param repository - Destination working tree after staging.
+ * @param source - Scan for this backup. Selected paths are not excluded.
+ * @param previouslyIgnored - Ignored paths inside the selection before any removal.
+ * @param signal - CLI cancellation signal.
+ */
+async function keepRevealedIgnoredFiles(
+  repository: Repository,
+  source: Source,
+  previouslyIgnored: ReadonlySet<string>,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!previouslyIgnored.size) return
+  const untracked = await pathsWithStatus(repository, signal, '??')
+  const revealed = [...previouslyIgnored]
+    .filter(
+      (path) =>
+        untracked.has(path) &&
+        !source.entries.has(path) &&
+        withinDestinationRoot(source, path),
+    )
+    .sort()
+  if (!revealed.length) return
+  const patterns: string[] = []
+  for (const path of revealed) {
+    if (path.includes('\n') || path.includes('\0'))
+      throw new Error(
+        `Could not keep ignored ${JSON.stringify(path)} on disk after its ignore rule left the source. Nothing was pushed.`,
+      )
+    let escaped = ''
+    for (const character of path)
+      escaped += ' \\*?[]'.includes(character) ? `\\${character}` : character
+    patterns.push(`/${escaped}`)
+  }
+  const excludePath = join(repository.gitDirectory, 'info', 'exclude')
+  await mkdir(dirname(excludePath), { recursive: true })
+  let existing = ''
+  try {
+    existing = await readFile(excludePath, 'utf8')
+  } catch (error) {
+    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT'))
+      throw error
+  }
+  const present = new Set(existing.split('\n'))
+  const additions = patterns.filter((pattern) => !present.has(pattern))
+  if (!additions.length) return
+  const prefix = existing.length === 0 || existing.endsWith('\n') ? '' : '\n'
+  await appendFile(excludePath, `${prefix}${additions.join('\n')}\n`)
+}
+
 /** Deletes a {@link Plan}'s removals, streams exact selected paths into Git, and checks staged blob IDs/types for {@link backup} before commit.
  * Paths already staged with the expected blob ID and mode are not re-added, but every selected path is still verified.
  * @param plan - Original source byte/type manifest and the tracked paths it no longer contains, from {@link validateDestination}.
@@ -623,6 +830,7 @@ export async function stageSource(
 ): Promise<boolean> {
   const { source, removals } = plan
   // An empty pathspec list makes git rm exit 128.
+  let previouslyIgnored = new Set<string>()
   if (removals.size) {
     const checked = new Set<string>()
     for (const path of removals)
@@ -632,21 +840,44 @@ export async function stageSource(
         await checkDestinationDirectory(ancestor, repository)
         checked.add(ancestor)
       }
-    await git(
-      repository.directory,
-      ['rm', '--quiet', '--pathspec-from-file=-', '--pathspec-file-nul'],
+    // Snapshot while the tracked ignore file still exists. After it is removed, those paths look like ordinary untracked files.
+    for (const path of await pathsWithStatus(repository, signal, '!!'))
+      if (withinDestinationRoot(source, path)) previouslyIgnored.add(path)
+    const { unlink, indexOnly, aliases } = await classifyRemovals(
+      source,
+      repository,
+      removals,
       signal,
-      {
-        input: (function* () {
-          for (const path of removals) yield `${path}\0`
-        })(),
-      },
     )
+    for (const kept of aliases)
+      await retitleKeptFile(repository, kept, signal)
+    const removePaths = async (paths: string[], cached: boolean) => {
+      if (!paths.length) return
+      const args = [
+        'rm',
+        '--quiet',
+        '--pathspec-from-file=-',
+        '--pathspec-file-nul',
+      ]
+      if (cached) args.splice(1, 0, '--cached')
+      await git(repository.directory, args, signal, {
+        input: (function* () {
+          for (const path of paths) yield `${path}\0`
+        })(),
+      })
+    }
+    await removePaths(unlink, false)
+    await removePaths(indexOnly, true)
     // git rm exits 0 after a failed unlink once an earlier path was removed.
-    for (const path of removals)
+    for (const path of unlink)
       if (await maybeLstat(join(repository.directory, ...path.split('/'))))
         throw new Error(
           `Could not delete ${JSON.stringify(path)} from the clone. Nothing was pushed.`,
+        )
+    for (const kept of aliases)
+      if (!(await maybeLstat(join(repository.directory, ...kept.split('/')))))
+        throw new Error(
+          `Could not keep ${JSON.stringify(kept)} while removing its other tracked name. Nothing was pushed.`,
         )
   }
   const files = new Map(
@@ -742,5 +973,11 @@ export async function stageSource(
   )
   if (deleted !== removals.size)
     throw new Error('Git did not stage every deletion. Nothing was pushed.')
+  await keepRevealedIgnoredFiles(
+    repository,
+    source,
+    previouslyIgnored,
+    signal,
+  )
   return changed
 }
