@@ -620,7 +620,7 @@ async function classifyRemovals(
   repository: Repository,
   removals: ReadonlySet<string>,
   signal: AbortSignal,
-): Promise<{ unlink: string[]; indexOnly: string[]; aliases: string[] }> {
+): Promise<{ unlink: string[]; indexOnly: string[]; keptPaths: string[] }> {
   const keptInodes = new Map<string, string>()
   for (const [path, entry] of source.entries) {
     if (entry.kind === 'directory') continue
@@ -633,7 +633,7 @@ async function classifyRemovals(
   }
   const unlink: string[] = []
   const indexOnly: string[] = []
-  const aliases = new Set<string>()
+  const keptPaths = new Set<string>()
   const unlinkedInodes = new Set<string>()
   for (const path of removals) {
     signal.throwIfAborted()
@@ -648,19 +648,19 @@ async function classifyRemovals(
     const kept = keptInodes.get(inode)
     if (kept || unlinkedInodes.has(inode)) {
       indexOnly.push(path)
-      if (kept) aliases.add(kept)
+      if (kept) keptPaths.add(kept)
       continue
     }
     unlink.push(path)
     unlinkedInodes.add(inode)
   }
-  return { unlink, indexOnly, aliases: [...aliases] }
+  return { unlink, indexOnly, keptPaths: [...keptPaths] }
 }
 
 /**
  * The volume keeps the first spelling it stored for a directory entry, and `git status` stays dirty if the index spelling and the directory entry disagree.
  */
-async function retitleKeptFile(
+async function renameDirectoryEntryToSource(
   repository: Repository,
   kept: string,
   signal: AbortSignal,
@@ -711,14 +711,15 @@ async function retitleKeptFile(
 async function pathsWithStatus(
   repository: Repository,
   signal: AbortSignal,
-  marker: '!!' | '??',
+  kind: 'ignored' | 'untracked',
 ): Promise<Set<string>> {
+  const marker = kind === 'ignored' ? '!!' : '??'
   const paths = new Set<string>()
   await git(
     repository.directory,
     [
       'status',
-      ...(marker === '!!' ? ['--ignored'] : []),
+      ...(kind === 'ignored' ? ['--ignored'] : []),
       '--porcelain=v1',
       '-z',
       '--untracked-files=all',
@@ -736,15 +737,15 @@ async function pathsWithStatus(
   return paths
 }
 
-async function keepRevealedIgnoredFiles(
+async function appendRevealedIgnoresToExclude(
   repository: Repository,
   source: Source,
-  previouslyIgnored: ReadonlySet<string>,
+  ignoredBeforeRemoval: ReadonlySet<string>,
   signal: AbortSignal,
 ): Promise<void> {
-  if (!previouslyIgnored.size) return
-  const untracked = await pathsWithStatus(repository, signal, '??')
-  const revealed = [...previouslyIgnored]
+  if (!ignoredBeforeRemoval.size) return
+  const untracked = await pathsWithStatus(repository, signal, 'untracked')
+  const revealed = [...ignoredBeforeRemoval]
     .filter(
       (path) =>
         untracked.has(path) &&
@@ -795,7 +796,7 @@ export async function stageSource(
   signal: AbortSignal,
 ): Promise<boolean> {
   const { source, removals } = plan
-  let previouslyIgnored = new Set<string>()
+  let ignoredBeforeRemoval = new Set<string>()
   if (removals.size) {
     const checked = new Set<string>()
     for (const path of removals)
@@ -805,16 +806,16 @@ export async function stageSource(
         await checkDestinationDirectory(ancestor, repository)
         checked.add(ancestor)
       }
-    for (const path of await pathsWithStatus(repository, signal, '!!'))
-      if (withinDestinationRoot(source, path)) previouslyIgnored.add(path)
-    const { unlink, indexOnly, aliases } = await classifyRemovals(
+    for (const path of await pathsWithStatus(repository, signal, 'ignored'))
+      if (withinDestinationRoot(source, path)) ignoredBeforeRemoval.add(path)
+    const { unlink, indexOnly, keptPaths } = await classifyRemovals(
       source,
       repository,
       removals,
       signal,
     )
-    for (const kept of aliases)
-      await retitleKeptFile(repository, kept, signal)
+    for (const kept of keptPaths)
+      await renameDirectoryEntryToSource(repository, kept, signal)
     const removePaths = async (paths: string[], cached: boolean) => {
       if (!paths.length) return
       const args = [
@@ -838,7 +839,7 @@ export async function stageSource(
         throw new Error(
           `Could not delete ${JSON.stringify(path)} from the clone. Nothing was pushed.`,
         )
-    for (const kept of aliases)
+    for (const kept of keptPaths)
       if (!(await maybeLstat(join(repository.directory, ...kept.split('/')))))
         throw new Error(
           `Could not keep ${JSON.stringify(kept)} while removing its other tracked name. Nothing was pushed.`,
@@ -937,10 +938,10 @@ export async function stageSource(
   )
   if (deleted !== removals.size)
     throw new Error('Git did not stage every deletion. Nothing was pushed.')
-  await keepRevealedIgnoredFiles(
+  await appendRevealedIgnoresToExclude(
     repository,
     source,
-    previouslyIgnored,
+    ignoredBeforeRemoval,
     signal,
   )
   return changed
