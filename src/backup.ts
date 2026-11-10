@@ -153,7 +153,7 @@ export async function backup(
         `Warning: could not update the backup manifest; the next run rereads every file. ${detail}`,
       )
     })
-    await validateDestination(source, repository, signal)
+    const plan = await validateDestination(source, repository, signal)
     affectedPath = join(repository.directory, source.name)
     if ((await headCommit(repository, signal)) !== originalHead)
       throw new Error(
@@ -164,7 +164,7 @@ export async function backup(
     phase = 'copying'
     await copySource(source, repository, signal)
     phase = 'staging'
-    const changed = await stageSource(source, repository, signal)
+    const changed = await stageSource(plan, repository, signal)
     if (
       (await headCommit(repository, signal)) !== originalHead ||
       (await currentBranch(repository, signal)) !== config.branch
@@ -229,7 +229,11 @@ export async function backup(
       ],
       signal,
     )
-    return `Backed up ${JSON.stringify(source.name)} to ${config.githubRepository} (${config.branch}, ${commit.slice(0, 12)}). All pending branch commits were pushed.`
+    const { size } = plan.removals
+    const removed = size
+      ? ` Removed ${size} ${size === 1 ? 'path' : 'paths'} missing from the source.`
+      : ''
+    return `Backed up ${JSON.stringify(source.name)} to ${config.githubRepository} (${config.branch}, ${commit.slice(0, 12)}).${removed} All pending branch commits were pushed.`
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     const recovery = ['copying', 'staging', 'committing'].includes(phase)

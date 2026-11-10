@@ -88,6 +88,41 @@ test.skipIf(process.platform === 'win32')(
 )
 
 test.skipIf(process.platform === 'win32')(
+  'stops before committing when a file missing from the directory source cannot be deleted',
+  async () => {
+    // Arrange
+    const world = await createWorld()
+    await put(join(world.repo, 'notes', 'a.md'), 'deletable\n')
+    await put(join(world.repo, 'notes', 'locked', 'b.md'), 'undeletable\n')
+    await world.commit()
+    await put(join(world.source, 'notes', 'new.md'), 'new\n')
+    const locked = join(world.repo, 'notes', 'locked')
+    await chmod(locked, 0o500)
+    try {
+      // Act / Assert
+      await expect(world.cli(['--repo', world.repo, 'notes'])).rejects.toThrow(
+        'Could not delete "notes/locked/b.md" from the clone',
+      )
+      expect(await readFile(join(locked, 'b.md'), 'utf8')).toBe(
+        'undeletable\n',
+      )
+      expect(
+        (await world.git(['rev-list', '--count', 'HEAD'])).stdout.trim(),
+      ).toBe('1')
+      expect(
+        (
+          await world
+            .git(['show-ref'], world.remote)
+            .catch(() => ({ stdout: '' }))
+        ).stdout,
+      ).toBe('')
+    } finally {
+      await chmod(locked, 0o755)
+    }
+  },
+)
+
+test.skipIf(process.platform === 'win32')(
   'preserves the previous registration when saving a new destination fails',
   async () => {
     // Arrange

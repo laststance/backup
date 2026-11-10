@@ -365,10 +365,10 @@ test('preserves a mapped source-parent alias through copy and stability rescan',
     signal,
     'cooking/too.txt',
   )
-  await validateDestination(source, repository, signal)
+  const plan = await validateDestination(source, repository, signal)
   // Act
   await copySource(source, repository, signal)
-  const changed = await stageSource(source, repository, signal)
+  const changed = await stageSource(plan, repository, signal)
   // Assert
   expect(changed).toBe(true)
   expect([...source.entries.keys()]).toEqual(['cooking/too.txt'])

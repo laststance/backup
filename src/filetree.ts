@@ -46,6 +46,35 @@ export type Source = {
   scannedAtNs: bigint
 }
 
+const planned: unique symbol = Symbol('Plan')
+
+/** A checked destination that only {@link validateDestination} can create and only {@link stageSource} applies. */
+export type Plan = {
+  readonly source: Source
+  /** Index spellings of tracked blobs and symlinks under a directory selection that the scan no longer contains. */
+  readonly removals: ReadonlySet<string>
+  readonly [planned]: true
+}
+
+/** Bounds a selection by its destination root for {@link validateDestination}, {@link copySource}, and {@link stageSource}.
+ * @param source - Manifest whose destination root is the selection.
+ * @param path - Repository-relative destination key.
+ * @returns Whether the key is the root or lies below it; `cooking/recipes2` is outside `cooking/recipes`.
+ * @example withinDestinationRoot(source, 'cooking/recipes/dinner.txt') // => true for source.name 'cooking/recipes'
+ */
+function withinDestinationRoot(source: Source, path: string): boolean {
+  return path === source.name || path.startsWith(`${source.name}/`)
+}
+
+/** Names the components {@link walkSource} skips, so {@link validateDestination} and {@link stageSource} never treat an unscanned path as removed.
+ * @param component - One path component.
+ * @returns Whether the component is an exact `.git` entry.
+ * @example isScanExcluded('.git') // => true
+ */
+function isScanExcluded(component: string): boolean {
+  return component === '.git'
+}
+
 /** Captures metadata for {@link scanSource} to detect replacement or writes while bytes are read.
  * @param stats - Non-following, nanosecond-resolution entry metadata.
  * @returns A stable identity/change marker for this scan.
@@ -220,7 +249,7 @@ async function walkSource(
         ignoreBOM: true,
       }).decode(childBytes)
       // Ordinary .git is excluded; aliases reject the entire operation before any copy.
-      if (childName === '.git') continue
+      if (isScanExcluded(childName)) continue
       if (metadataAlias(childName))
         throw new Error(
           `Git metadata alias in source: ${JSON.stringify(childName)}`,
@@ -277,17 +306,19 @@ async function checkDestinationDirectory(
 }
 
 /** Validates the whole destination after fetch and before {@link copySource}, preventing partial conflict writes.
+ * A directory selection also collects the tracked paths below it that the scan no longer contains.
  * @param source - Complete source manifest.
  * @param repository - Locked destination working tree.
  * @param signal - CLI cancellation signal.
- * @returns Resolves only when all selected paths and their required parents can be merged safely.
- * @example await validateDestination(source, repository, signal)
+ * @returns The {@link Plan} for {@link stageSource}, once all selected paths, their parents, and every removal are safe.
+ * @throws On any conflict, including a removal that is a submodule, unmerged, or hidden by skip-worktree or assume-unchanged.
+ * @example const plan = await validateDestination(source, repository, signal)
  */
 export async function validateDestination(
   source: Source,
   repository: Repository,
   signal: AbortSignal,
-): Promise<void> {
+): Promise<Plan> {
   const upperMetadata = await maybeLstat(join(repository.directory, '.GIT'))
   const lowerMetadata = await lstat(join(repository.directory, '.git'), {
     bigint: true,
@@ -341,10 +372,13 @@ export async function validateDestination(
         )
     }
   }
+  const selectsDirectory =
+    source.entries.get(source.name)?.kind === 'directory'
+  const removals = new Set<string>()
   await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
-        const { mode, path } = parseStageRecord(record)
+        const { mode, stage, path } = parseStageRecord(record)
         // Every tracked prefix participates, including parents of unrelated tracked siblings.
         for (const prefix of [...destinationAncestors(path), path]) {
           const target = required.get(canonicalKey(prefix))
@@ -359,23 +393,42 @@ export async function validateDestination(
               `Tracked path collision or submodule: ${JSON.stringify(path)}`,
             )
         }
+        if (
+          !selectsDirectory ||
+          !withinDestinationRoot(source, path) ||
+          selected.has(canonicalKey(path)) ||
+          path.split('/').some(isScanExcluded)
+        )
+          continue
+        if (mode === '160000')
+          throw new Error(
+            `Tracked path collision or submodule: ${JSON.stringify(path)}`,
+          )
+        if (stage !== '0')
+          throw new Error(
+            `Tracked path has an unresolved merge conflict: ${JSON.stringify(path)}. Resolve it and retry.`,
+          )
+        removals.add(path)
       }
     },
   })
   await git(repository.directory, ['ls-files', '-v', '-z'], signal, {
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
+        const path = record.slice(2)
         // Flags on unselected siblings do not prevent creating their shared parent.
+        // git rm discards a hidden assume-unchanged edit that assertClean cannot see.
         if (
-          selected.has(canonicalKey(record.slice(2))) &&
+          (selected.has(canonicalKey(path)) || removals.has(path)) &&
           (record[0] === 'S' || record[0] !== record[0]?.toUpperCase())
         )
           throw new Error(
-            `Selected path has skip-worktree or assume-unchanged set: ${JSON.stringify(record.slice(2))}. Clear the flag and retry.`,
+            `Path to back up or delete has skip-worktree or assume-unchanged set: ${JSON.stringify(path)}. Clear the flag and retry.`,
           )
       }
     },
   })
+  return { source, removals, [planned]: true }
 }
 
 /** Creates and rechecks each destination parent for {@link copySource} without traversing symlinks.
@@ -473,7 +526,7 @@ export async function copySource(
   for (const [path, entry] of source.entries) {
     signal.throwIfAborted()
     // Manifest destinations are not source paths: only the suffix below the selected root belongs to the origin.
-    if (path !== source.name && !path.startsWith(`${source.name}/`))
+    if (!withinDestinationRoot(source, path))
       throw new Error(
         `Source manifest entry is outside its destination root: ${JSON.stringify(path)}`,
       )
@@ -565,19 +618,48 @@ export async function copySource(
   }
 }
 
-/** Streams exact selected paths into Git and checks staged blob IDs/types for {@link backup} before commit.
+/** Deletes a {@link Plan}'s removals, streams exact selected paths into Git, and checks staged blob IDs/types for {@link backup} before commit.
  * Paths already staged with the expected blob ID and mode are not re-added, but every selected path is still verified.
- * @param source - Original source byte/type manifest.
+ * @param plan - Original source byte/type manifest and the tracked paths it no longer contains, from {@link validateDestination}.
  * @param repository - Destination working tree after copying.
  * @param signal - CLI cancellation signal.
- * @returns Whether selected content differs from HEAD.
- * @example await stageSource(source, repository, signal)
+ * @returns Whether selected content or deletions differ from HEAD.
+ * @throws When a removal survives in the clone or index, or Git stages any other path.
+ * @example await stageSource(plan, repository, signal)
  */
 export async function stageSource(
-  source: Source,
+  plan: Plan,
   repository: Repository,
   signal: AbortSignal,
 ): Promise<boolean> {
+  const { source, removals } = plan
+  // An empty pathspec list makes git rm exit 128.
+  if (removals.size) {
+    const checked = new Set<string>()
+    for (const path of removals)
+      for (const ancestor of destinationAncestors(path)) {
+        if (checked.has(ancestor)) continue
+        signal.throwIfAborted()
+        await checkDestinationDirectory(ancestor, repository)
+        checked.add(ancestor)
+      }
+    await git(
+      repository.directory,
+      ['rm', '--quiet', '--pathspec-from-file=-', '--pathspec-file-nul'],
+      signal,
+      {
+        input: (function* () {
+          for (const path of removals) yield `${path}\0`
+        })(),
+      },
+    )
+    // git rm exits 0 after a failed unlink once an earlier path was removed.
+    for (const path of removals)
+      if (await maybeLstat(join(repository.directory, ...path.split('/'))))
+        throw new Error(
+          `Could not delete ${JSON.stringify(path)} from the clone. Nothing was pushed.`,
+        )
+  }
   const files = new Map(
     [...source.entries].filter(([, entry]) => entry.kind !== 'directory'),
   )
@@ -627,7 +709,16 @@ export async function stageSource(
       for await (const record of readNulRecords(output)) {
         const { mode, oid, stage, path } = parseStageRecord(record)
         const entry = files.get(path)
-        if (!entry) continue
+        if (!entry) {
+          if (
+            withinDestinationRoot(source, path) &&
+            !path.split('/').some(isScanExcluded)
+          )
+            throw new Error(
+              `Git still tracks a path the source no longer contains: ${JSON.stringify(path)}. Nothing was pushed.`,
+            )
+          continue
+        }
         if (mode !== entry.mode || oid !== entry.oid || stage !== '0') {
           throw new Error(
             `Git changed the selected bytes or entry type: ${JSON.stringify(path)}. Inspect .gitattributes, filters, and index flags; nothing was pushed.`,
@@ -642,6 +733,7 @@ export async function stageSource(
       'Git did not stage every selected file. Nothing was pushed.',
     )
   let changed = false
+  let deleted = 0
   await git(
     repository.directory,
     ['diff', '--cached', '--name-only', '--no-renames', '-z'],
@@ -649,7 +741,8 @@ export async function stageSource(
     {
       consume: async (output) => {
         for await (const path of readNulRecords(output)) {
-          if (!files.has(path))
+          if (removals.has(path)) deleted++
+          else if (!files.has(path))
             throw new Error(
               `Unselected staged change detected: ${JSON.stringify(path)}. Nothing was pushed.`,
             )
@@ -658,5 +751,7 @@ export async function stageSource(
       },
     },
   )
+  if (deleted !== removals.size)
+    throw new Error('Git did not stage every deletion. Nothing was pushed.')
   return changed
 }

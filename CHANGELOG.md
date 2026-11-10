@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0.0] - 2026-11-10
+
+### Changed
+
+- Delete tracked files and symlinks under a backed-up directory when the source no longer contains them, so the clone and the pushed commit match the source. This is a breaking change. Earlier versions kept those files. A file or symlink backup still changes only that path.
+- Keep every path outside the selection, including previously flattened backups and siblings such as `cooking/recipes2` next to `cooking/recipes`. Ignored files that Git does not track also stay.
+- Report `Removed N paths missing from the source.` after a backup that deletes files.
+
+### Security
+
+- Reject a backup before copying when it would delete a submodule or a path with assume-unchanged or skip-worktree set. `git status` does not show edits hidden by those flags, and deleting the file would discard them.
+
 ## [0.3.0.0] - 2026-11-03
 
 ### Changed
