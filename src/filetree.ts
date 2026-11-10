@@ -56,21 +56,10 @@ export type Plan = {
   readonly [planned]: true
 }
 
-/** Bounds a selection by its destination root for {@link validateDestination}, {@link copySource}, and {@link stageSource}.
- * @param source - Manifest whose destination root is the selection.
- * @param path - Repository-relative destination key.
- * @returns Whether the key is the root or lies below it; `cooking/recipes2` is outside `cooking/recipes`.
- * @example withinDestinationRoot(source, 'cooking/recipes/dinner.txt') // => true for source.name 'cooking/recipes'
- */
 function withinDestinationRoot(source: Source, path: string): boolean {
   return path === source.name || path.startsWith(`${source.name}/`)
 }
 
-/** Names the components {@link walkSource} skips, so {@link validateDestination} and {@link stageSource} never treat an unscanned path as removed.
- * @param component - One path component.
- * @returns Whether the component is an exact `.git` entry.
- * @example isScanExcluded('.git') // => true
- */
 function isScanExcluded(component: string): boolean {
   return component === '.git'
 }
