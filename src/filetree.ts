@@ -411,7 +411,6 @@ export async function validateDestination(
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
         const path = record.slice(2)
-        // Flags on unselected siblings do not prevent creating their shared parent.
         // git rm discards a hidden assume-unchanged edit that assertClean cannot see.
         if (
           (selected.has(canonicalKey(path)) || removals.has(path)) &&
@@ -614,15 +613,7 @@ export async function copySource(
 }
 
 /**
- * Separates index names the scan no longer contains into files to delete and names that are the same directory entry as a kept file.
- *
  * Volumes such as APFS store one entry for some distinct Unicode names. Deleting the old name would delete the file {@link copySource} just wrote under the source name.
- *
- * @param source - Scan whose files and symlinks must remain in the clone.
- * @param repository - Destination working tree after copying.
- * @param removals - Index spellings from {@link validateDestination}.
- * @param signal - CLI cancellation signal.
- * @returns Paths to unlink, paths to drop from the index only, and source paths that share an inode with an index-only name.
  */
 async function classifyRemovals(
   source: Source,
@@ -655,7 +646,6 @@ async function classifyRemovals(
     }
     const inode = `${stats.dev}:${stats.ino}`
     const kept = keptInodes.get(inode)
-    // A second index name for a file already chosen for deletion must not unlink it again.
     if (kept || unlinkedInodes.has(inode)) {
       indexOnly.push(path)
       if (kept) aliases.add(kept)
@@ -668,13 +658,7 @@ async function classifyRemovals(
 }
 
 /**
- * Gives a kept file the source spelling before its old index name is removed.
- *
- * The directory entry otherwise keeps the first spelling the volume stored. `git rm` of the old index name then deletes the file, and `git status` stays dirty if the index spelling and the directory entry disagree.
- *
- * @param repository - Destination working tree.
- * @param kept - Source path that shares its inode with a removal.
- * @param signal - CLI cancellation signal.
+ * The volume keeps the first spelling it stored for a directory entry, and `git status` stays dirty if the index spelling and the directory entry disagree.
  */
 async function retitleKeptFile(
   repository: Repository,
@@ -704,7 +688,7 @@ async function retitleKeptFile(
     await symlink(await readlink(from), temporary)
   } else {
     try {
-      // Some filesystems reject a hard link. The temporary copy still preserves the bytes.
+      // Some filesystems reject a hard link.
       await link(from, temporary)
     } catch {
       await copyFile(from, temporary)
@@ -724,14 +708,6 @@ async function retitleKeptFile(
   }
 }
 
-/**
- * Reads porcelain paths with one status marker for {@link stageSource}.
- *
- * @param repository - Destination working tree.
- * @param signal - CLI cancellation signal.
- * @param marker - `!!` for ignored paths, or `??` for untracked paths.
- * @returns Repository-relative paths Git reported with that marker.
- */
 async function pathsWithStatus(
   repository: Repository,
   signal: AbortSignal,
@@ -760,16 +736,6 @@ async function pathsWithStatus(
   return paths
 }
 
-/**
- * Records ignored files that become untracked when their ignore rule is deleted.
- *
- * {@link assertClean} rejects any untracked file, including one that was ignored until this backup removed the tracked ignore file. A local exclude keeps the file on disk without putting it in the backup, and a later run stays clean. `git add --force` still stages the file if a later backup selects it.
- *
- * @param repository - Destination working tree after staging.
- * @param source - Scan for this backup. Selected paths are not excluded.
- * @param previouslyIgnored - Ignored paths inside the selection before any removal.
- * @param signal - CLI cancellation signal.
- */
 async function keepRevealedIgnoredFiles(
   repository: Repository,
   source: Source,
@@ -829,7 +795,6 @@ export async function stageSource(
   signal: AbortSignal,
 ): Promise<boolean> {
   const { source, removals } = plan
-  // An empty pathspec list makes git rm exit 128.
   let previouslyIgnored = new Set<string>()
   if (removals.size) {
     const checked = new Set<string>()
@@ -840,7 +805,6 @@ export async function stageSource(
         await checkDestinationDirectory(ancestor, repository)
         checked.add(ancestor)
       }
-    // Snapshot while the tracked ignore file still exists. After it is removed, those paths look like ordinary untracked files.
     for (const path of await pathsWithStatus(repository, signal, '!!'))
       if (withinDestinationRoot(source, path)) previouslyIgnored.add(path)
     const { unlink, indexOnly, aliases } = await classifyRemovals(
