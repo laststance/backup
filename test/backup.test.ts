@@ -5,6 +5,7 @@ import {
   mkdir,
   readFile,
   readlink,
+  rename,
   rm,
   symlink,
   truncate,
@@ -741,6 +742,133 @@ test('keeps an ignored untracked file while dropping a tracked file removed from
     (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
       .stdout,
   ).toBe('.gitignore\nnotes/a.md\n')
+})
+
+test('keeps the file when a directory source renames it to a spelling the volume stores as the same file', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.source, 'notes', 'strasse.md'), 'street\n')
+  await world.cli(['--repo', world.repo, 'notes'])
+  await rename(
+    join(world.source, 'notes', 'strasse.md'),
+    join(world.source, 'notes', 'straße.md'),
+  )
+  await writeFile(join(world.source, 'notes', 'straße.md'), 'avenue\n')
+
+  // Act
+  const second = await world.cli(['notes'])
+  const third = await world.cli(['notes'])
+
+  // Assert
+  expect(second.stdout).toContain('Removed 1 path missing from the source')
+  expect(third.stdout).toContain('Unchanged')
+  expect(await readFile(join(world.repo, 'notes', 'straße.md'), 'utf8')).toBe(
+    'avenue\n',
+  )
+  expect(
+    (
+      await world.git(
+        ['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', 'main'],
+        world.remote,
+      )
+    ).stdout,
+  ).toBe('notes/straße.md\n')
+  expect((await world.git(['status', '--porcelain=v1'])).stdout).toBe('')
+})
+
+test('drops an older tracked spelling when the clone already has both names for one file', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.source, 'notes', 'strasse.md'), 'street\n')
+  await world.cli(['--repo', world.repo, 'notes'])
+  const folded = join(world.repo, 'notes', 'straße.md')
+  await lstat(folded).catch(async () => {
+    await put(folded, 'street\n')
+  })
+  const blob = (
+    await world.git(['hash-object', '--', 'notes/straße.md'])
+  ).stdout.trim()
+  await world.git([
+    'update-index',
+    '--add',
+    '--cacheinfo',
+    `100644,${blob},notes/straße.md`,
+  ])
+  await world.git(['commit', '-m', 'both spellings'])
+  await rename(
+    join(world.source, 'notes', 'strasse.md'),
+    join(world.source, 'notes', 'straße.md'),
+  )
+  await writeFile(join(world.source, 'notes', 'straße.md'), 'avenue\n')
+
+  // Act
+  const second = await world.cli(['notes'])
+  const third = await world.cli(['notes'])
+
+  // Assert
+  expect(second.stdout).toContain('Removed 1 path missing from the source')
+  expect(third.stdout).toContain('Unchanged')
+  expect(await readFile(join(world.repo, 'notes', 'straße.md'), 'utf8')).toBe(
+    'avenue\n',
+  )
+  expect(
+    (
+      await world.git(
+        ['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', 'main'],
+        world.remote,
+      )
+    ).stdout,
+  ).toBe('notes/straße.md\n')
+  expect((await world.git(['status', '--porcelain=v1'])).stdout).toBe('')
+})
+
+test('pushes a deleted tracked ignore file and leaves the ignored file on disk', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.source, 'notes', '.gitignore'), '*.log\n')
+  await put(join(world.source, 'notes', 'a.md'), 'a\n')
+  await world.cli(['--repo', world.repo, 'notes'])
+  await put(join(world.repo, 'notes', 'debug.log'), 'local debug output\n')
+  await rm(join(world.source, 'notes', '.gitignore'))
+
+  // Act
+  const second = await world.cli(['notes'])
+  const third = await world.cli(['notes'])
+
+  // Assert
+  expect(second.stdout).toContain('Removed 1 path missing from the source')
+  expect(third.stdout).toContain('Unchanged')
+  expect(await readFile(join(world.repo, 'notes', 'debug.log'), 'utf8')).toBe(
+    'local debug output\n',
+  )
+  expect(
+    (
+      await world.git(
+        ['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', 'main'],
+        world.remote,
+      )
+    ).stdout,
+  ).toBe('notes/a.md\n')
+
+  // Act
+  await put(join(world.source, 'notes', 'debug.log'), 'now selected\n')
+  const fourth = await world.cli(['notes'])
+
+  // Assert
+  expect(fourth.stdout).toContain(
+    'Backed up "notes" to test-owner/private-backup',
+  )
+  expect(
+    (
+      await world.git(
+        ['-c', 'core.quotepath=false', 'ls-tree', '-r', '--name-only', 'main'],
+        world.remote,
+      )
+    ).stdout,
+  ).toBe('notes/a.md\nnotes/debug.log\n')
+  expect(await readFile(join(world.repo, 'notes', 'debug.log'), 'utf8')).toBe(
+    'now selected\n',
+  )
 })
 
 test('drops a tracked skill removed from a .claude directory the clone ignores when its parent is backed up', async () => {
