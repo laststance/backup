@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test'
 import {
   chmod,
   lstat,
+  mkdir,
   readFile,
   readlink,
   rm,
@@ -15,7 +16,7 @@ import { createWorld, put, recover, useFixtures } from './helpers'
 
 useFixtures()
 
-test('registers one private clone and restores original binary bytes and retained directory entries', async () => {
+test('registers one private clone, restores binary bytes, and drops a file removed from the backed-up directory', async () => {
   // Arrange
   const world = await createWorld()
   await put(
@@ -29,16 +30,25 @@ test('registers one private clone and restores original binary bytes and retaine
   await world.cli(['--repo', world.repo, 'notes'])
   await rm(join(world.source, 'notes', 'removed.md'))
   const again = await world.cli(['notes'])
+  const third = await world.cli(['notes'])
   const restored = await recover(world)
 
   // Assert
-  expect(again.stdout).toContain('Unchanged')
+  expect(again.stdout).toContain('Removed 1 path missing from the source')
+  expect(again.stdout).not.toContain('Unchanged')
+  expect(third.stdout).toContain('Unchanged')
   expect([...(await readFile(join(restored, 'notes', 'binary.dat')))]).toEqual([
     0, 255, 13, 10, 128,
   ])
-  expect(await readFile(join(restored, 'notes', 'removed.md'), 'utf8')).toBe(
-    'retain me\n',
-  )
+  expect(
+    await lstat(join(restored, 'notes', 'removed.md')).catch(() => undefined),
+  ).toBeUndefined()
+  expect(
+    await lstat(join(world.repo, 'notes', 'removed.md')).catch(() => undefined),
+  ).toBeUndefined()
+  expect(
+    (await world.git(['show', 'main~1:notes/removed.md'], world.remote)).stdout,
+  ).toBe('retain me\n')
   expect(
     await lstat(join(world.repo, 'notes', '.git')).catch(() => undefined),
   ).toBeUndefined()
@@ -208,6 +218,55 @@ test.each(['--assume-unchanged', '--skip-worktree'])(
     )
   },
 )
+
+test.each(['--assume-unchanged', '--skip-worktree'])(
+  'rejects deleting a file hidden by %s before copying the directory source',
+  async (flag) => {
+    // Arrange
+    const world = await createWorld()
+    await put(join(world.repo, 'notes', 'hidden.md'), 'committed\n')
+    await world.commit()
+    await world.git(['update-index', flag, 'notes/hidden.md'])
+    await put(join(world.repo, 'notes', 'hidden.md'), 'local edit\n')
+    await put(join(world.source, 'notes', 'new.md'), 'must not copy\n')
+
+    // Act / Assert
+    await expect(world.cli(['--repo', world.repo, 'notes'])).rejects.toThrow(
+      'skip-worktree or assume-unchanged',
+    )
+    expect(await readFile(join(world.repo, 'notes', 'hidden.md'), 'utf8')).toBe(
+      'local edit\n',
+    )
+    expect(
+      await lstat(join(world.repo, 'notes', 'new.md')).catch(() => undefined),
+    ).toBeUndefined()
+  },
+)
+
+test('rejects a submodule inside the selected directory before copying', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, 'seed.txt'), 'seed\n')
+  await world.commit()
+  const head = (await world.git(['rev-parse', 'HEAD'])).stdout.trim()
+  await mkdir(join(world.repo, 'notes', 'vendor'), { recursive: true })
+  await world.git([
+    'update-index',
+    '--add',
+    '--cacheinfo',
+    `160000,${head},notes/vendor`,
+  ])
+  await world.git(['commit', '-m', 'track submodule'])
+  await put(join(world.source, 'notes', 'new.md'), 'must not copy\n')
+
+  // Act / Assert
+  await expect(world.cli(['--repo', world.repo, 'notes'])).rejects.toThrow(
+    'submodule',
+  )
+  expect(
+    await lstat(join(world.repo, 'notes', 'new.md')).catch(() => undefined),
+  ).toBeUndefined()
+})
 
 test('rejects every selected write when a later destination entry has a different type', async () => {
   // Arrange
@@ -556,6 +615,164 @@ test('updates only the mapped file and retains old flattened copies and unrelate
   expect(await readFile(join(world.repo, 'cooking', 'too.txt'), 'utf8')).toBe(
     'updated recipe\n',
   )
+})
+
+test('drops a skill directory removed from a backed-up .claude directory', async () => {
+  // Arrange
+  const world = await createWorld()
+  const claude = join(world.source, 'zumen-fe', '.claude')
+  await put(join(claude, 'settings.json'), '{"model":"opus"}\n')
+  await put(join(claude, 'skills', 'keep', 'SKILL.md'), '# keep\n')
+  await put(
+    join(claude, 'skills', 'apidog-spec-from-hook', 'SKILL.md'),
+    '# apidog\n',
+  )
+  await world.cli(['--repo', world.repo, 'zumen-fe/.claude'])
+  await rm(join(claude, 'skills', 'apidog-spec-from-hook'), {
+    recursive: true,
+  })
+
+  // Act
+  await world.cli(['zumen-fe/.claude'])
+  const repeated = await world.cli(['zumen-fe/.claude'])
+
+  // Assert
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe(
+    'zumen-fe/.claude/settings.json\nzumen-fe/.claude/skills/keep/SKILL.md\n',
+  )
+  expect(repeated.stdout).toContain('Unchanged')
+  expect(
+    (
+      await world.git(['rev-list', '--count', 'main'], world.remote)
+    ).stdout.trim(),
+  ).toBe('2')
+})
+
+test('drops files removed from a nested directory source and keeps neighbors that share its prefix', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, 'cooking', 'other.txt'), 'other\n')
+  await put(join(world.repo, 'cooking', 'recipes2', 'kept.txt'), 'recipes2\n')
+  await put(join(world.repo, 'cooking', 'recipes-extra', 'x.txt'), 'extra\n')
+  await world.commit()
+  const recipes = join(world.source, 'cooking', 'recipes')
+  await put(join(recipes, 'dinner.txt'), 'dinner\n')
+  await put(join(recipes, 'dessert', 'cake.txt'), 'cake\n')
+  await put(join(recipes, 'lunch.txt'), 'lunch\n')
+  await world.cli(['--repo', world.repo, 'cooking/recipes'])
+  await rm(join(recipes, 'dinner.txt'))
+  await rm(join(recipes, 'dessert'), { recursive: true })
+
+  // Act
+  const result = await world.cli(['cooking/recipes'])
+  const restored = await recover(world)
+
+  // Assert
+  expect(result.stdout).toContain('Removed 2 paths missing from the source')
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe(
+    'cooking/other.txt\ncooking/recipes-extra/x.txt\ncooking/recipes/lunch.txt\ncooking/recipes2/kept.txt\n',
+  )
+  expect(
+    await lstat(join(world.repo, 'cooking', 'recipes', 'dinner.txt')).catch(
+      () => undefined,
+    ),
+  ).toBeUndefined()
+  expect(
+    await lstat(join(world.repo, 'cooking', 'recipes', 'dessert')).catch(
+      () => undefined,
+    ),
+  ).toBeUndefined()
+  expect(
+    await lstat(join(restored, 'cooking', 'recipes', 'dinner.txt')).catch(
+      () => undefined,
+    ),
+  ).toBeUndefined()
+  expect(
+    await lstat(join(restored, 'cooking', 'recipes', 'dessert')).catch(
+      () => undefined,
+    ),
+  ).toBeUndefined()
+  expect(await readFile(join(world.repo, 'cooking', 'other.txt'), 'utf8')).toBe(
+    'other\n',
+  )
+  expect(
+    await readFile(join(world.repo, 'cooking', 'recipes2', 'kept.txt'), 'utf8'),
+  ).toBe('recipes2\n')
+  expect(
+    await readFile(
+      join(world.repo, 'cooking', 'recipes-extra', 'x.txt'),
+      'utf8',
+    ),
+  ).toBe('extra\n')
+  expect(await readFile(join(restored, 'cooking', 'other.txt'), 'utf8')).toBe(
+    'other\n',
+  )
+  expect(
+    await readFile(join(restored, 'cooking', 'recipes2', 'kept.txt'), 'utf8'),
+  ).toBe('recipes2\n')
+  expect(
+    await readFile(join(restored, 'cooking', 'recipes-extra', 'x.txt'), 'utf8'),
+  ).toBe('extra\n')
+})
+
+test('keeps an ignored untracked file while dropping a tracked file removed from the directory source', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, '.gitignore'), '*.log\n')
+  await put(join(world.repo, 'notes', 'old.md'), 'old\n')
+  await world.commit()
+  await put(join(world.repo, 'notes', 'debug.log'), 'local debug output\n')
+  await put(join(world.source, 'notes', 'a.md'), 'a\n')
+
+  // Act
+  await world.cli(['--repo', world.repo, 'notes'])
+
+  // Assert
+  expect(await readFile(join(world.repo, 'notes', 'debug.log'), 'utf8')).toBe(
+    'local debug output\n',
+  )
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe('.gitignore\nnotes/a.md\n')
+})
+
+test('drops a tracked skill removed from a .claude directory the clone ignores when its parent is backed up', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, '.gitignore'), '.claude\n')
+  await world.commit()
+  const skills = join(world.source, 'zumen-fe', '.claude', 'skills')
+  await put(join(skills, 'keep', 'SKILL.md'), '# keep\n')
+  await put(join(skills, 'old', 'SKILL.md'), '# old\n')
+  await world.cli(['--repo', world.repo, 'zumen-fe'])
+  await rm(join(skills, 'old'), { recursive: true })
+
+  // Act
+  await world.cli(['zumen-fe'])
+
+  // Assert
+  expect(
+    (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+      .stdout,
+  ).toBe('.gitignore\nzumen-fe/.claude/skills/keep/SKILL.md\n')
+  expect(
+    await lstat(
+      join(world.repo, 'zumen-fe', '.claude', 'skills', 'old'),
+    ).catch(() => undefined),
+  ).toBeUndefined()
+  expect(
+    await readFile(
+      join(world.repo, 'zumen-fe', '.claude', 'skills', 'keep', 'SKILL.md'),
+      'utf8',
+    ),
+  ).toBe('# keep\n')
 })
 
 test('backs up a source-parent alias into unrelated Git metadata without changing its approved destination', async () => {
