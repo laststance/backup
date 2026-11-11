@@ -14,7 +14,8 @@ Absolute sources beneath home (including ~/) retain their path below home;
 absolute sources outside home use their basename. Missing parents are created.
 Existing parents must be directories, not files, symlinks, or submodules;
 Git metadata paths and conflicting tracked spellings are rejected.
-Old flattened backups and unselected files are retained.
+A directory source deletes tracked files it no longer contains.
+Paths outside the selected path, including old flattened backups, are kept.
 
 Options:
   --repo <directory>  Register an existing private clone (alone: setup only)
