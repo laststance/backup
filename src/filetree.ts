@@ -905,8 +905,18 @@ export async function stageSource(
           continue
         }
         if (mode !== entry.mode || oid !== entry.oid || stage !== '0') {
+          // Temporary CI diagnostics for the Windows folded-spelling failure.
+          const probe = async (args: string[]) =>
+            (
+              await git(repository.directory, args, signal, {
+                allowFailure: true,
+              })
+            ).stdout
+          const disk = await maybeLstat(
+            join(repository.directory, ...path.split('/')),
+          )
           throw new Error(
-            `Git changed the selected bytes or entry type: ${JSON.stringify(path)}. Inspect .gitattributes, filters, and index flags; nothing was pushed.`,
+            `Git changed the selected bytes or entry type: ${JSON.stringify(path)} staged ${JSON.stringify({ mode, oid, stage })} expected ${JSON.stringify({ mode: entry.mode, oid: entry.oid })} disk ${JSON.stringify(disk && { size: Number(disk.size), ino: String(disk.ino), mtimeNs: String(disk.mtimeNs) })} status ${JSON.stringify(await probe(['status', '--porcelain=v1', '-z']))} index ${JSON.stringify(await probe(['ls-files', '--stage', '-z']))} debug ${JSON.stringify(await probe(['ls-files', '--stage', '--debug']))} hash ${JSON.stringify(await probe(['hash-object', '--', path]))}. Inspect .gitattributes, filters, and index flags; nothing was pushed.`,
           )
         }
         matched++
