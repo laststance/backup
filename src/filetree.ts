@@ -6,6 +6,7 @@ import {
   cp,
   link,
   lstat,
+  lutimes,
   mkdir,
   readdir,
   readFile,
@@ -14,6 +15,7 @@ import {
   rename,
   symlink,
   unlink,
+  utimes,
 } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import type { BigIntStats } from 'node:fs'
@@ -572,6 +574,11 @@ export async function copySource(
         verbatimSymlinks: true,
         force: true,
       })
+      // Git for Windows matches index stat at second granularity, so a same-second rewrite with the same size and creation time looks unchanged and `git add` keeps the stale blob.
+      const bumped = new Date(Date.now() + 2_000)
+      if (entry.kind === 'symlink')
+        await lutimes(destination, bumped, bumped)
+      else await utimes(destination, bumped, bumped)
       const copied = await readEntry(
         destination,
         await lstat(destination, { bigint: true }),
