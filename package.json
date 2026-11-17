@@ -43,8 +43,8 @@
     "bench": "bun run build && bun bench/incremental.ts"
   },
   "devDependencies": {
-    "@types/bun": "1.4.2",
-    "@types/node": "24.13.3",
+    "@types/bun": "1.4.4",
+    "@types/node": "26.6.6",
     "typescript": "7.0.2"
   }
 }
