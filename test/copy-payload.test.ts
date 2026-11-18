@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
-import { readdir } from 'node:fs/promises'
+import { chmod, lstat, readdir, writeFile } from 'node:fs/promises'
+import { userInfo } from 'node:os'
 import { join } from 'node:path'
 import { runCommand } from '../src/utils/run-command'
 import { createWorld, put, useFixtures } from './helpers'
@@ -57,5 +58,59 @@ test.skipIf(process.platform !== 'darwin')(
       // macOS can also retain ACLs on the destination of the final native copy.
       await runCommand('/bin/chmod', ['-R', '-P', '-N', world.root])
     }
+  },
+)
+
+test.skipIf(process.platform !== 'darwin')(
+  'repeats a backup with native write-only permissions and rejects a later local edit or different staged blob',
+  async () => {
+    // Arrange
+    const world = await createWorld()
+    const source = join(world.source, 'report')
+    const copy = join(world.repo, 'report')
+    await put(source, 'first')
+    await chmod(source, 0o240)
+    await runCommand('/bin/chmod', [
+      '+a',
+      `user:${userInfo().username} allow read,readattr,readextattr,readsecurity`,
+      source,
+    ])
+    await world.cli(['--repo', world.repo, 'report'])
+
+    // Act
+    const repeat = await world.cli(['report'])
+
+    // Assert
+    expect(repeat.stdout).toContain('Unchanged')
+    expect((await lstat(copy)).mode & 0o777).toBe(0o240)
+    expect(
+      (
+        await world.git(['rev-list', '--count', 'main'], world.remote)
+      ).stdout.trim(),
+    ).toBe('1')
+
+    // Arrange / Act: a clean index with a different committed blob must invalidate the saved proof.
+    const alternate = join(world.root, 'alternate')
+    await put(alternate, 'other')
+    const { stdout: oid } = await world.git(['hash-object', '-w', alternate])
+    await world.git([
+      'update-index',
+      '--cacheinfo',
+      `100644,${oid.trim()},report`,
+    ])
+    await world.git(['commit', '-qm', 'Different index content'])
+
+    // Assert
+    await expect(world.cli(['report'])).rejects.toThrow('uncommitted changes')
+
+    // Arrange / Act: same-length worktree edits must also invalidate the proof for the original blob.
+    await world.git(['reset', '--mixed', 'HEAD^'])
+    await writeFile(copy, 'local')
+
+    // Assert
+    await expect(world.cli(['report'])).rejects.toThrow('uncommitted changes')
+    expect(
+      (await world.git(['show', 'main:report'], world.remote)).stdout,
+    ).toBe('first')
   },
 )

@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   readdir,
+  readFile,
   readlink,
   symlink,
 } from 'node:fs/promises'
@@ -191,4 +192,83 @@ test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
       await chmod(world.repo, 0o755)
     }
   },
+)
+
+test.skipIf(process.platform !== 'darwin')(
+  'uses HFS+ lookup for sharp-s and overwrites a tracked file with a read-only worktree on a separate device',
+  async () => {
+    // Arrange
+    const world = await createWorld()
+    const mount = join(world.root, 'hfs')
+    const checkout = join(mount, 'checkout')
+    const reference = join(mount, 'reference')
+    const image = join(world.root, 'hfs.sparseimage')
+    await mkdir(mount)
+    await put(join(world.repo, 'report.txt'), 'initial')
+    await world.commit()
+    await put(join(world.source, 'one', 'straße.txt'), 'sharp-s')
+    await put(join(world.source, 'two', 'strasse.txt'), 'double-s')
+    await put(join(world.source, 'report.txt'), 'updated')
+    await runCommand('hdiutil', [
+      'create',
+      '-size',
+      '64m',
+      '-fs',
+      'HFS+',
+      '-volname',
+      'BackupHFS',
+      '-type',
+      'SPARSE',
+      '-o',
+      image,
+    ])
+    await runCommand('hdiutil', [
+      'attach',
+      image,
+      '-mountpoint',
+      mount,
+      '-nobrowse',
+    ])
+    try {
+      await world.git(['worktree', 'add', '-b', 'hfs', checkout])
+      await mkdir(reference)
+      await runCommand(
+        '/bin/cp',
+        ['-R', '--', 'one/straße.txt', 'two/strasse.txt', reference],
+        { cwd: world.source },
+      )
+
+      // Act
+      await world.cli(['--repo', checkout, 'one/straße.txt', 'two/strasse.txt'])
+      await chmod(checkout, 0o555)
+      try {
+        await world.cli(['--repo', checkout, 'report.txt'])
+      } finally {
+        await chmod(checkout, 0o755)
+      }
+
+      // Assert
+      const expected = await readdir(reference)
+      expect(expected.sort()).toEqual(['strasse.txt', 'straße.txt'])
+      expect(
+        (
+          await world.git(
+            ['ls-tree', '-rz', '--name-only', 'hfs'],
+            world.remote,
+          )
+        ).stdout.split('\0'),
+      ).toEqual(['report.txt', ...expected, ''])
+      for (const name of expected) {
+        expect(
+          (await world.git(['show', 'hfs:' + name], world.remote)).stdout,
+        ).toBe(await readFile(join(reference, name), 'utf8'))
+      }
+      expect(
+        (await world.git(['show', 'hfs:report.txt'], world.remote)).stdout,
+      ).toBe('updated')
+    } finally {
+      await runCommand('hdiutil', ['detach', mount])
+    }
+  },
+  60_000,
 )

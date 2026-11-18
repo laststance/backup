@@ -235,7 +235,7 @@ export async function backup(
     await validateRegistration(repository, config, signal)
     if ((await headCommit(repository, signal)) !== commit)
       throw new Error('HEAD changed before push. Inspect the branch and retry.')
-    await restoreCopiedModes(repository, addedRead)
+    await restoreCopiedModes(repository, addedRead, files)
     if (!commit || commit === remoteCommit)
       return `Unchanged: ${JSON.stringify(label)}. Remote is up to date.`
     phase = 'pushing'

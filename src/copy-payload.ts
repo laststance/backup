@@ -34,7 +34,7 @@ async function copyLeaves(
   to: string,
   scratch: string,
   signal: AbortSignal,
-  fold: (path: string) => string,
+  fold: (path: string) => Promise<string>,
 ): Promise<void> {
   if (!names.length) return
   const incoming = await mkdtemp(join(scratch, 'leaves-'))
@@ -81,7 +81,7 @@ async function copyLeaves(
     spellings.clear()
   }
   for (const name of names) {
-    const key = fold(basename(name))
+    const key = await fold(basename(name))
     const bytes = Buffer.byteLength(name) + 10
     // Do not let same-name inputs interact in the acquisition directory, or exceed the Windows argv limit.
     if (batch.length && (size + bytes > limit || spellings.has(key)))
@@ -103,7 +103,7 @@ async function prepareDirectory(
   payload: string,
   scratch: string,
   signal: AbortSignal,
-  fold: (path: string) => string,
+  fold: (path: string) => Promise<string>,
 ): Promise<void> {
   await mkdir(payload, { mode: 0o700 })
   const leaves: string[] = []
@@ -156,7 +156,7 @@ export async function prepareOperands(
   sources: readonly Source[],
   scratch: string,
   signal: AbortSignal,
-  fold: (path: string) => string,
+  fold: (path: string) => Promise<string>,
 ) {
   const cwd = join(scratch, 'payload')
   await mkdir(cwd)
@@ -176,7 +176,7 @@ export async function prepareOperands(
     let path = locations.get(identity)
     if (!path) {
       let parent = cwd
-      const key = fold(source.name)
+      const key = await fold(source.name)
       if (claimed.has(key) || source.name === '.') {
         parent = join(scratch, String(locations.size))
         await mkdir(parent)

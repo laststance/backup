@@ -24,6 +24,11 @@ import { readManifest, settledBlobs } from './manifest'
 import type { KnownBlob } from './manifest'
 import { isWithin } from './utils/is-within'
 import { maybeLstat } from './utils/maybe-lstat'
+import {
+  recordRestoredCopy,
+  restoredIndexEntry,
+  signature,
+} from './utils/restored-copy'
 import { readNulRecords } from './utils/read-nul-records'
 import { metadataAlias } from './utils/metadata-alias'
 import { parseStageRecord } from './utils/parse-stage-record'
@@ -32,7 +37,7 @@ import {
   resolveBackupPath,
   resolveSourcePath,
 } from './utils/resolve-backup-path'
-import { copyPathFold } from './utils/fold-copy-path'
+import { copyPathKeys } from './utils/fold-copy-path'
 
 export type Entry = {
   kind: 'directory' | 'file' | 'symlink' | 'special'
@@ -52,22 +57,6 @@ export type Source = {
   entries: Map<string, Entry>
   /** Wall-clock start of the scan, the reference point for {@link settledBlobs}. */
   scannedAtNs: bigint
-}
-
-/** Captures metadata for {@link scanSource} to detect replacement or writes while bytes are read.
- * @param stats - Non-following, nanosecond-resolution entry metadata.
- * @returns A stable identity/change marker for this scan.
- * @example signature(await lstat(path, { bigint: true }))
- */
-function signature(stats: BigIntStats): string {
-  return [
-    stats.dev,
-    stats.ino,
-    stats.size,
-    stats.mode,
-    stats.mtimeNs,
-    stats.ctimeNs,
-  ].join(':')
 }
 
 /** Hashes raw entries for {@link scanSource} and {@link copySources}, independently of Git filters.
@@ -236,7 +225,7 @@ async function walkSource(
   signal: AbortSignal,
   knownBlobs: ReadonlyMap<string, KnownBlob>,
   readErrors?: Error[],
-  allowed?: (key: string) => boolean,
+  allowed?: (key: string) => Promise<boolean>,
 ): Promise<Map<string, Entry>> {
   const entries = new Map<string, Entry>()
   const visit = async (
@@ -244,7 +233,7 @@ async function walkSource(
     relativePath: string,
   ): Promise<void> => {
     signal.throwIfAborted()
-    if (allowed && !allowed(relativePath))
+    if (allowed && !(await allowed(relativePath)))
       throw new Error(
         `Unexpected entry in private copy: ${JSON.stringify(relativePath)}`,
       )
@@ -318,22 +307,28 @@ function destinationAncestors(path: string): string[] {
     .map((_, index) => components.slice(0, index + 1).join('/'))
 }
 
-/** Protects the resolved Git administration roots, including separate git dirs inside the worktree.
- * @example assertPayloadPath(destination, repository, fold)
+/** Checks actual protected directory spellings before destination traversal or inode enumeration.
+ * @example await isAdministrativePath(destination, repository, fold)
  */
-function assertPayloadPath(
+async function isAdministrativePath(
   path: string,
   repository: Repository,
-  fold: (path: string) => string,
-): void {
-  if (
-    [repository.gitDirectory, repository.commonDirectory].some((root) =>
-      isWithin(fold(root), fold(path)),
+  fold: (path: string) => Promise<string>,
+): Promise<boolean> {
+  const payload = relative(repository.directory, path).split(sep).join('/')
+  for (const root of [repository.commonDirectory, repository.gitDirectory]) {
+    if (isWithin(root, repository.directory)) return true
+    if (!isWithin(repository.directory, root)) continue
+    const admin = relative(repository.directory, root).split(sep).join('/')
+    const depth = admin.split('/').length
+    // Compare only through the protected root. Never open naming probes within Git's administrative tree.
+    if (
+      (await fold(payload.split('/').slice(0, depth).join('/'))) ===
+      (await fold(admin))
     )
-  )
-    throw new Error(
-      `Destination escapes the backup or aliases Git metadata: ${JSON.stringify(path)}`,
-    )
+      return true
+  }
+  return false
 }
 
 /** Resolves the referent of a destination link, including a missing leaf, before cp may write through it.
@@ -344,7 +339,7 @@ async function destinationReferent(
   repository: Repository,
   incomingLinks: ReadonlyMap<string, string>,
   linksInOperand: ReadonlySet<string>,
-  fold: (path: string) => string,
+  fold: (path: string) => Promise<string>,
 ): Promise<string> {
   const pending = path.split('/')
   const components: string[] = []
@@ -364,13 +359,13 @@ async function destinationReferent(
     if (metadataAlias(part)) throw escape()
     const key = [...components, part].join('/')
     const target = join(repository.directory, key)
-    assertPayloadPath(target, repository, fold)
+    if (await isAdministrativePath(target, repository, fold)) throw escape()
     // cp and readdir can visit siblings in different orders. Both possible link targets must stay isolated.
-    if (linksInOperand.has(fold(key)))
+    if (linksInOperand.has(await fold(key)))
       throw new Error(
         `Copy would write through a link replaced within the same source: ${JSON.stringify(key)}`,
       )
-    let link = incomingLinks.get(fold(key))
+    let link = incomingLinks.get(await fold(key))
     if (link === undefined && (await maybeLstat(target))?.isSymbolicLink())
       link = await readlink(target)
     if (link === undefined) {
@@ -380,10 +375,23 @@ async function destinationReferent(
     if (++followed > 40)
       throw new Error(`Destination symlink cycle: ${JSON.stringify(path)}`)
     if (isAbsolute(link)) {
-      const root = repository.directory + sep
-      if (fold(link) === fold(repository.directory)) link = ''
-      else if (fold(link).startsWith(fold(root))) link = link.slice(root.length)
-      else throw escape()
+      const parts = link.split(sep === '\\' ? /[\\/]/ : '/')
+      const depth = repository.directory.split(sep).length
+      const prefix = parts.slice(0, depth).join(sep)
+      if (prefix !== repository.directory) {
+        // Alternate spellings of the root must identify the real repository directory before dropping the prefix.
+        const [original, candidate] = await Promise.all([
+          lstat(repository.directory, { bigint: true }),
+          maybeLstat(prefix),
+        ])
+        if (
+          !candidate?.isDirectory() ||
+          original.dev !== candidate.dev ||
+          original.ino !== candidate.ino
+        )
+          throw escape()
+      }
+      link = parts.slice(depth).join(sep)
       components.length = 0
     }
     pending.unshift(...link.split(sep === '\\' ? /[\\/]/ : '/'))
@@ -398,7 +406,7 @@ async function hardlinkNames(
   target: BigIntStats,
   repository: Repository,
   signal: AbortSignal,
-  fold: (path: string) => string,
+  fold: (path: string) => Promise<string>,
 ): Promise<string[]> {
   const aliases: string[] = []
   const visit = async (directory: string): Promise<void> => {
@@ -407,12 +415,7 @@ async function hardlinkNames(
       if (metadataAlias(child.name)) continue
       const absolute = join(directory, child.name)
       // Excluding administrative roots makes an alias into metadata fail the link-count check.
-      if (
-        [repository.gitDirectory, repository.commonDirectory].some((root) =>
-          isWithin(fold(root), fold(absolute)),
-        )
-      )
-        continue
+      if (await isAdministrativePath(absolute, repository, fold)) continue
       if (child.isDirectory()) await visit(absolute)
       else if (child.isFile()) {
         const stats = await lstat(absolute, { bigint: true })
@@ -442,15 +445,37 @@ export async function validateDestination(
 ): Promise<Map<string, Entry>> {
   if ((await realpath(repository.directory)) !== repository.directory)
     throw new Error('Destination parent changed or escaped the repository.')
-  const fold = await copyPathFold(repository.directory, repository.gitDirectory)
+  const names = copyPathKeys(repository.directory)
+  try {
+    return await planDestination(
+      sources,
+      repository,
+      signal,
+      addedRead,
+      names.key,
+    )
+  } finally {
+    await names.close()
+  }
+}
+
+/** Models ordered native writes and maps each selected entry onto its Git index spelling. */
+async function planDestination(
+  sources: readonly Source[],
+  repository: Repository,
+  signal: AbortSignal,
+  addedRead: Set<string>,
+  fold: (path: string) => Promise<string>,
+): Promise<Map<string, Entry>> {
   const files = new Map<string, Entry>()
+  const restrictedTargets = new Map<string, BigIntStats>()
   const spellings = new Map<string, string>()
   // New aliases share a physical leaf on folding volumes, even before Git has indexed a spelling.
-  const setFile = (path: string, entry: Entry) => {
+  const setFile = async (path: string, entry: Entry) => {
     let physical = ''
     for (const component of path.split('/')) {
       const prefix = physical ? physical + '/' + component : component
-      const key = fold(prefix)
+      const key = await fold(prefix)
       physical = spellings.get(key) ?? prefix
       spellings.set(key, physical)
     }
@@ -459,8 +484,8 @@ export async function validateDestination(
     if (entry.kind !== 'file') addedRead.delete(physical)
     return firstWrite ? physical : undefined
   }
-  const plannedEntry = (path: string) =>
-    files.get(spellings.get(fold(path)) ?? path)
+  const plannedEntry = async (path: string) =>
+    files.get(spellings.get(await fold(path)) ?? path)
   const directories = new Set<string>()
   const incomingLinks = new Map<string, string>()
   const hardlinks = new Map<string, string[]>()
@@ -468,7 +493,13 @@ export async function validateDestination(
   for (const source of sources) {
     const linksInOperand = new Set<string>()
     for (const [key, entry] of source.entries) {
-      if (entry.kind === 'symlink') linksInOperand.add(fold(key))
+      if (entry.kind !== 'symlink') continue
+      const destination = join(repository.directory, key)
+      if (await isAdministrativePath(destination, repository, fold))
+        throw new Error(
+          `Destination escapes the backup or aliases Git metadata: ${JSON.stringify(destination)}`,
+        )
+      linksInOperand.add(await fold(key))
     }
     for (const [key, entry] of source.entries) {
       signal.throwIfAborted()
@@ -483,8 +514,8 @@ export async function validateDestination(
       let path = key
       for (const parent of destinationAncestors(key)) {
         if (
-          linksInOperand.has(fold(parent)) ||
-          incomingLinks.has(fold(parent)) ||
+          linksInOperand.has(await fold(parent)) ||
+          incomingLinks.has(await fold(parent)) ||
           (
             await maybeLstat(join(repository.directory, parent))
           )?.isSymbolicLink()
@@ -502,13 +533,16 @@ export async function validateDestination(
         }
       }
       const destination = join(repository.directory, path)
-      assertPayloadPath(destination, repository, fold)
+      if (await isAdministrativePath(destination, repository, fold))
+        throw new Error(
+          `Destination escapes the backup or aliases Git metadata: ${JSON.stringify(destination)}`,
+        )
       if (entry.kind === 'directory') {
         directories.add(path)
         // Even an empty directory operand must not operate on metadata through a destination alias.
         if (
           (await maybeLstat(destination))?.isSymbolicLink() ||
-          incomingLinks.has(fold(path))
+          incomingLinks.has(await fold(path))
         )
           await destinationReferent(
             path,
@@ -523,13 +557,16 @@ export async function validateDestination(
       // A regular source writes through a destination link. A source symlink replaces the leaf itself.
       if (entry.kind === 'symlink') {
         const suffix = source.name === '.' ? key : relative(source.name, key)
-        incomingLinks.set(fold(path), await readlink(join(source.path, suffix)))
+        incomingLinks.set(
+          await fold(path),
+          await readlink(join(source.path, suffix)),
+        )
       }
       if (
         entry.kind === 'file' &&
-        plannedEntry(path)?.mode !== '10000' &&
-        (linksInOperand.has(fold(path)) ||
-          incomingLinks.has(fold(path)) ||
+        (await plannedEntry(path))?.mode !== '10000' &&
+        (linksInOperand.has(await fold(path)) ||
+          incomingLinks.has(await fold(path)) ||
           existing?.isSymbolicLink())
       )
         path = await destinationReferent(
@@ -544,7 +581,7 @@ export async function validateDestination(
           ? existing
           : await maybeLstat(join(repository.directory, path))
       // Opening a destination FIFO for writing would block the clone lock until an unrelated reader connects.
-      const previous = plannedEntry(path)
+      const previous = await plannedEntry(path)
       if (
         entry.kind === 'file' &&
         (previous ? previous.mode === '10000' : target?.isFIFO())
@@ -552,11 +589,13 @@ export async function validateDestination(
         throw new Error(
           `Cannot copy a regular file into a destination FIFO: ${JSON.stringify(path)}`,
         )
-      const firstWrite = setFile(path, entry)
+      const firstWrite = await setFile(path, entry)
       if (firstWrite && entry.privateRead && !target) addedRead.add(firstWrite)
+      if (firstWrite && target?.isFile() && !(target.mode & 0o400n))
+        restrictedTargets.set(firstWrite, target)
       // Replacing a leaf removes that name from its original inode before later operands run.
       if (entry.kind !== 'file' && target?.isFile() && target.nlink > 1n)
-        detachedAliases.add(fold(path))
+        detachedAliases.add(await fold(path))
       if (entry.kind === 'file' && target?.isFile() && target.nlink > 1n) {
         // Writing this inode also writes every other hardlink. Prove all its names are inside the clone.
         const id = `${target.dev}:${target.ino}`
@@ -566,7 +605,8 @@ export async function validateDestination(
           hardlinks.set(id, aliases)
         }
         for (const alias of aliases) {
-          if (!detachedAliases.has(fold(alias))) setFile(alias, entry)
+          if (!detachedAliases.has(await fold(alias)))
+            await setFile(alias, entry)
         }
       }
     }
@@ -575,16 +615,19 @@ export async function validateDestination(
   const trackedSpellings = new Map<string, string>()
   for (const path of [...directories, ...files.keys()]) {
     for (const required of [...destinationAncestors(path), path])
-      selected.add(fold(required))
+      selected.add(await fold(required))
   }
   await git(repository.directory, ['ls-files', '-v', '--stage', '-z'], signal, {
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
         const { path, mode } = parseStageRecord(record.slice(2))
+        let selectedPath = false
         // A submodule or a hidden index change must never be overwritten by a payload copy.
         for (const prefix of [...destinationAncestors(path), path]) {
-          const key = fold(prefix)
-          if (!selected.has(key)) continue
+          const key = await fold(prefix)
+          // Every selected ancestor is present, so deeper unrelated names never need a filesystem lookup.
+          if (!selected.has(key)) break
+          if (path === prefix) selectedPath = true
           const known = trackedSpellings.get(key)
           if (
             (known && known !== prefix) ||
@@ -596,7 +639,7 @@ export async function validateDestination(
           trackedSpellings.set(key, prefix)
         }
         if (
-          selected.has(fold(path)) &&
+          selectedPath &&
           (record[0] === 'S' || record[0] !== record[0]?.toUpperCase())
         )
           throw new Error(
@@ -610,9 +653,17 @@ export async function validateDestination(
   for (const [path, entry] of files) {
     let key = path
     for (const prefix of [...destinationAncestors(path), path]) {
-      const tracked = trackedSpellings.get(fold(prefix))
+      const tracked = trackedSpellings.get(await fold(prefix))
       if (tracked) key = tracked + path.slice(prefix.length)
     }
+    if (key !== path && addedRead.delete(path)) addedRead.add(key)
+    const restricted = restrictedTargets.get(path)
+    if (
+      entry.kind === 'file' &&
+      restricted &&
+      (await restoredIndexEntry(repository, key, restricted))
+    )
+      addedRead.add(key)
     mapped.set(key, entry)
   }
   return mapped
@@ -625,6 +676,7 @@ export async function validateDestination(
 export async function restoreCopiedModes(
   repository: Repository,
   addedRead: Set<string>,
+  verified?: ReadonlyMap<string, Entry>,
 ): Promise<void> {
   for (const key of addedRead) {
     const path = join(repository.directory, key)
@@ -645,6 +697,34 @@ export async function restoreCopiedModes(
             `Copied entry changed before restoring permissions: ${JSON.stringify(key)}`,
           )
         await handle.chmod(Number(current.mode & 0o7377n))
+        const entry = verified?.get(key)
+        if (entry) {
+          // The descriptor remains readable after chmod. Bind the final stat to the exact staged bytes.
+          const restored = await handle.stat({ bigint: true })
+          const hash = createHash(repository.objectFormat).update(
+            `blob ${restored.size}\0`,
+          )
+          for await (const chunk of handle.createReadStream({
+            autoClose: false,
+          }))
+            hash.update(chunk)
+          if (
+            entry.signature !== signature(current) ||
+            entry.oid !== hash.digest('hex') ||
+            signature(restored) !==
+              signature(await handle.stat({ bigint: true }))
+          )
+            throw new Error(
+              `Copied entry changed before recording permissions: ${JSON.stringify(key)}`,
+            )
+          await recordRestoredCopy(
+            repository,
+            key,
+            restored,
+            entry.mode,
+            entry.oid,
+          )
+        }
       } finally {
         await handle.close()
       }
@@ -671,7 +751,8 @@ export async function copySources(
   )
   const addedRead = readableUntilStaged ?? new Set<string>()
   try {
-    const fold = await copyPathFold(scratch)
+    // The scratch tree, including any spelling probes, is removed by the existing outer finally.
+    const fold = copyPathKeys(scratch, true).key
     const prepared = await prepareOperands(sources, scratch, signal, fold)
     const operands: string[] = []
     const verified: Source[] = []
@@ -680,7 +761,7 @@ export async function copySources(
       const expected = new Map<string, Entry[]>()
       for (const [key, entry] of source.entries) {
         if (process.platform === 'darwin' && entry.mode === '140000') continue
-        const identity = fold(key)
+        const identity = await fold(key)
         const candidates = expected.get(identity) ?? []
         candidates.push(entry)
         expected.set(identity, candidates)
@@ -693,11 +774,11 @@ export async function copySources(
         signal,
         new Map(),
         readErrors.length ? readErrors : undefined,
-        (key) => expected.has(fold(key)),
+        async (key) => expected.has(await fold(key)),
       )
       const seen = new Set<string>()
       for (const [key, entry] of copied) {
-        const identity = fold(key)
+        const identity = await fold(key)
         if (
           !expected
             .get(identity)
@@ -732,12 +813,29 @@ export async function copySources(
 
     for (const [key, entry] of files) {
       const path = join(repository.directory, key)
-      const copied = await readEntry(
-        path,
-        await lstat(path, { bigint: true }),
-        repository,
-        signal,
-      )
+      let stats = await lstat(path, { bigint: true })
+      // A repeat copy may overwrite an owner-writable file whose native mode still prevents verification.
+      if (
+        addedRead.has(key) &&
+        entry.kind === 'file' &&
+        stats.isFile() &&
+        !(stats.mode & 0o400n)
+      ) {
+        const handle = await open(
+          path,
+          constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        )
+        try {
+          const current = await handle.stat({ bigint: true })
+          if (signature(current) !== signature(stats))
+            throw new Error(`Copied entry changed: ${JSON.stringify(key)}`)
+          await handle.chmod(Number(current.mode & 0o7777n) | 0o400)
+          stats = await handle.stat({ bigint: true })
+        } finally {
+          await handle.close()
+        }
+      }
+      const copied = await readEntry(path, stats, repository, signal)
       if (
         copied.oid !== entry.oid ||
         copied.kind !== entry.kind ||
@@ -881,6 +979,7 @@ export async function stageSource(
             `Git changed the selected bytes or entry type: ${JSON.stringify(path)}. Inspect .gitattributes, filters, and index flags; nothing was pushed.`,
           )
         }
+        selected.set(path, entry)
         matched++
       }
     },
