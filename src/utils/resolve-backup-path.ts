@@ -79,11 +79,14 @@ export async function resolveSourcePath(operand: string): Promise<string> {
     leaf === '.' ||
     leaf === '..'
   let path = operand
-  if (process.platform === 'win32') {
-    // Win32 collapses '..' lexically. Git for Windows' cp traverses the physical link target first.
-    const root = parse(operand).root
+  const root = parse(operand).root
+  const components = operand
+    .slice(root.length)
+    .split(sep === '\\' ? /[\\/]+/ : /\/+/)
+  if (process.platform === 'win32' || components.includes('..')) {
+    // Resolve a link before climbing its parent. Some realpath implementations discard '..' first.
     path = root
-    for (const component of operand.slice(root.length).split(/[\\/]+/)) {
+    for (const component of components) {
       if (component === '..') path = dirname(await sourceDirectory(path))
       else if (component === '.') path = await sourceDirectory(path)
       else if (component) path = join(path, component)
