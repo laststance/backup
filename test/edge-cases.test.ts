@@ -8,6 +8,27 @@ import { readNulRecords } from '../src/utils/read-nul-records'
 
 useFixtures()
 
+test('shows how to find an ignored file copied before another operand fails', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, '.gitignore'), '*.log\n')
+  await world.commit()
+  await put(join(world.source, 'debug.log'), 'partial result\n')
+
+  // Act
+  const result = world.cli(['--repo', world.repo, 'debug.log', 'missing'])
+
+  // Assert
+  await expect(result).rejects.toThrow('git status --short --ignored')
+  expect((await world.git(['status', '--short', '--ignored'])).stdout).toBe(
+    '!! debug.log\n',
+  )
+  expect(await readFile(join(world.repo, 'debug.log'), 'utf8')).toBe(
+    'partial result\n',
+  )
+  expect((await world.git(['for-each-ref'], world.remote)).stdout).toBe('')
+})
+
 test.skipIf(process.platform === 'win32')(
   'reports partial copy failure and succeeds after deliberate repair',
   async () => {

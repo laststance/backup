@@ -259,7 +259,7 @@ export async function backup(
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     const recovery = ['copying', 'staging', 'committing'].includes(phase)
-      ? `\nAffected destination: ${JSON.stringify(affectedPath)}. No push was attempted. Inspect git status/diff in ${JSON.stringify(repository.directory)}; repair or commit the changes manually, then retry. No files were rolled back.`
+      ? `\nAffected destination: ${JSON.stringify(affectedPath)}. No push was attempted. Run git status --short --ignored in ${JSON.stringify(repository.directory)} and inspect the selected destinations directly. Review git diff and git diff --cached, then repair or commit the changes manually, then retry. No files were rolled back.`
       : ['push validation', 'pushing'].includes(phase)
         ? `\nLocal commits are retained in ${JSON.stringify(repository.directory)}. Push completion is unconfirmed. Fix the reported issue and rerun the same command; it fetches first and pushes all remaining commits without duplicating the backup commit.`
         : ''
