@@ -32,7 +32,7 @@ import {
   resolveBackupPath,
   resolveSourcePath,
 } from './utils/resolve-backup-path'
-import { foldCopyPath } from './utils/fold-copy-path'
+import { copyPathFold } from './utils/fold-copy-path'
 
 export type Entry = {
   kind: 'directory' | 'file' | 'symlink' | 'special'
@@ -442,14 +442,7 @@ export async function validateDestination(
 ): Promise<Map<string, Entry>> {
   if ((await realpath(repository.directory)) !== repository.directory)
     throw new Error('Destination parent changed or escaped the repository.')
-  const upper = await maybeLstat(join(repository.directory, '.GIT'))
-  const lower = await lstat(join(repository.directory, '.git'), {
-    bigint: true,
-  })
-  const fold = (path: string) =>
-    upper?.ino === lower.ino && upper?.dev === lower.dev
-      ? foldCopyPath(path)
-      : path
+  const fold = await copyPathFold(repository.directory, repository.gitDirectory)
   const files = new Map<string, Entry>()
   const spellings = new Map<string, string>()
   // New aliases share a physical leaf on folding volumes, even before Git has indexed a spelling.
@@ -466,9 +459,12 @@ export async function validateDestination(
     if (entry.kind !== 'file') addedRead.delete(physical)
     return firstWrite ? physical : undefined
   }
+  const plannedEntry = (path: string) =>
+    files.get(spellings.get(fold(path)) ?? path)
   const directories = new Set<string>()
   const incomingLinks = new Map<string, string>()
   const hardlinks = new Map<string, string[]>()
+  const detachedAliases = new Set<string>()
   for (const source of sources) {
     const linksInOperand = new Set<string>()
     for (const [key, entry] of source.entries) {
@@ -531,6 +527,7 @@ export async function validateDestination(
       }
       if (
         entry.kind === 'file' &&
+        plannedEntry(path)?.mode !== '10000' &&
         (linksInOperand.has(fold(path)) ||
           incomingLinks.has(fold(path)) ||
           existing?.isSymbolicLink())
@@ -542,12 +539,24 @@ export async function validateDestination(
           linksInOperand,
           fold,
         )
-      const firstWrite = setFile(path, entry)
       const target =
         path === key
           ? existing
           : await maybeLstat(join(repository.directory, path))
+      // Opening a destination FIFO for writing would block the clone lock until an unrelated reader connects.
+      const previous = plannedEntry(path)
+      if (
+        entry.kind === 'file' &&
+        (previous ? previous.mode === '10000' : target?.isFIFO())
+      )
+        throw new Error(
+          `Cannot copy a regular file into a destination FIFO: ${JSON.stringify(path)}`,
+        )
+      const firstWrite = setFile(path, entry)
       if (firstWrite && entry.privateRead && !target) addedRead.add(firstWrite)
+      // Replacing a leaf removes that name from its original inode before later operands run.
+      if (entry.kind !== 'file' && target?.isFile() && target.nlink > 1n)
+        detachedAliases.add(fold(path))
       if (entry.kind === 'file' && target?.isFile() && target.nlink > 1n) {
         // Writing this inode also writes every other hardlink. Prove all its names are inside the clone.
         const id = `${target.dev}:${target.ino}`
@@ -556,7 +565,9 @@ export async function validateDestination(
           aliases = await hardlinkNames(target, repository, signal, fold)
           hardlinks.set(id, aliases)
         }
-        for (const alias of aliases) setFile(alias, entry)
+        for (const alias of aliases) {
+          if (!detachedAliases.has(fold(alias))) setFile(alias, entry)
+        }
       }
     }
   }
@@ -660,15 +671,10 @@ export async function copySources(
   )
   const addedRead = readableUntilStaged ?? new Set<string>()
   try {
-    const prepared = await prepareOperands(sources, scratch, signal)
+    const fold = await copyPathFold(scratch)
+    const prepared = await prepareOperands(sources, scratch, signal, fold)
     const operands: string[] = []
     const verified: Source[] = []
-    const sample = await lstat(prepared.cwd, { bigint: true })
-    const alias = await maybeLstat(join(scratch, 'PAYLOAD'))
-    const fold = (key: string) =>
-      alias?.ino === sample.ino && alias.dev === sample.dev
-        ? foldCopyPath(key)
-        : key
     for (const [index, source] of prepared.sources.entries()) {
       // Case-sensitive sources can contribute more than one name to a single physical output.
       const expected = new Map<string, Entry[]>()
