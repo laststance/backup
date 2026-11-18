@@ -96,6 +96,17 @@ test.skipIf(!windows).each(['C:foo', 'C:', 'D:folder\\foo'])(
   },
 )
 
+test.skipIf(!windows).each([
+  '//server/share',
+  '//server/share/',
+  '\\\\server\\share',
+  '\\\\server\\share\\',
+  'C:/',
+])('rejects Windows filesystem roots before scanning (%j)', (input) => {
+  // Arrange / Act / Assert
+  expect(() => resolveBackupPath(input, { cwd })).toThrow('filesystem root')
+})
+
 test.skipIf(!windows)(
   'parses native drive paths and UNC shares by basename',
   () => {
@@ -114,9 +125,6 @@ test.skipIf(!windows)(
       path: '\\\\server\\share\\cooking\\too.txt',
       name: 'too.txt',
     })
-    expect(() => resolveBackupPath('\\\\server\\share\\', { cwd })).toThrow(
-      'filesystem root',
-    )
     expect(
       resolveBackupPath('\\Users\\example\\cooking\\too.txt', { cwd }),
     ).toEqual({

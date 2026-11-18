@@ -34,7 +34,8 @@ export function resolveBackupPath(
 
   if (path.split(separators).some(metadataAlias))
     throw new Error(`Git metadata alias in source: ${JSON.stringify(input)}`)
-  if (resolve(path) === parse(path).root)
+  const normalized = resolve(path)
+  if (normalized === parse(normalized).root)
     throw new Error(
       `The source cannot be a filesystem root: ${JSON.stringify(input)}`,
     )
