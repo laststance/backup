@@ -1,4 +1,13 @@
-import { basename, isAbsolute, parse, resolve, sep } from 'node:path'
+import { lstat, realpath } from 'node:fs/promises'
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  resolve,
+  sep,
+} from 'node:path'
 import { metadataAlias } from './metadata-alias'
 
 /** Preserves the operand spelling consumed by native cp and identifies its worktree destination for {@link scanSource}.
@@ -38,4 +47,45 @@ export function resolveBackupPath(
       'The destination cannot be the parent of the registered clone.',
     )
   return { path, name }
+}
+
+/** Resolves a directory required by a source operand before {@link resolveSourcePath} traverses it.
+ * @throws An ENOTDIR source error when a file is used as a directory.
+ * @example await sourceDirectory('/work/notes')
+ */
+async function sourceDirectory(path: string): Promise<string> {
+  const physical = await realpath(path)
+  if (!(await lstat(physical)).isDirectory())
+    throw Object.assign(new Error(`Not a directory: ${JSON.stringify(path)}`), {
+      code: 'ENOTDIR',
+    })
+  return physical
+}
+
+/** Resolves the parent for the source scan while preserving a plain leaf symlink for recursive copy.
+ * @param operand - An absolute operand with its original dot components and separators.
+ * @example await resolveSourcePath('/work/linked-directory/../choice')
+ */
+export async function resolveSourcePath(operand: string): Promise<string> {
+  const leaf = basename(operand)
+  const directoryOperand =
+    operand.endsWith('/') ||
+    operand.endsWith(sep) ||
+    leaf === '.' ||
+    leaf === '..'
+  let path = operand
+  if (process.platform === 'win32') {
+    // Win32 collapses '..' lexically. Git for Windows' cp traverses the physical link target first.
+    const root = parse(operand).root
+    path = root
+    for (const component of operand.slice(root.length).split(/[\\/]+/)) {
+      if (component === '..') path = dirname(await sourceDirectory(path))
+      else if (component === '.') path = await sourceDirectory(path)
+      else if (component) path = join(path, component)
+    }
+  }
+  // Node on Windows also accepts a trailing separator on a regular file, which GNU cp rejects.
+  return directoryOperand
+    ? sourceDirectory(path)
+    : join(await realpath(dirname(path)), basename(path))
 }

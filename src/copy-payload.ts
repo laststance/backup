@@ -11,6 +11,7 @@ import {
 import { basename, dirname, join, relative } from 'node:path'
 import type { Source } from './filetree'
 import { recursiveCopy } from './utils/recursive-copy'
+import { foldCopyPath } from './utils/fold-copy-path'
 import { maybeLstat } from './utils/maybe-lstat'
 import { runCommand } from './utils/run-command'
 
@@ -57,7 +58,7 @@ async function copyLeaves(
     spellings.clear()
   }
   for (const name of names) {
-    const key = name.normalize('NFC').toUpperCase()
+    const key = foldCopyPath(name)
     const bytes = Buffer.byteLength(name) + 3
     // Do not let same-name inputs interact in the acquisition directory, or exceed the Windows argv limit.
     if (batch.length && (size + bytes > 12_000 || spellings.has(key)))
@@ -160,7 +161,7 @@ export async function prepareOperands(
     let path = locations.get(identity)
     if (!path) {
       let parent = cwd
-      const key = source.name.normalize('NFC').toUpperCase()
+      const key = foldCopyPath(source.name)
       if (claimed.has(key) || source.name === '.') {
         parent = join(scratch, String(locations.size))
         await mkdir(parent)

@@ -398,28 +398,33 @@ test('detects staged-byte conversion for a nested mapped source before pushing',
   ).toBe('')
 })
 
-test.skipIf(process.platform === 'linux').each([
+test.each([
   ['Cooking', 'cooking'],
   ['Cafe\u0301', 'Café'],
 ])(
-  'merges into the tracked ancestor spelling on case-insensitive filesystems (%s, %s)',
+  'publishes under the existing directory spelling only when the volume treats the two names as aliases (%s, %s)',
   async (tracked, selected) => {
     // Arrange
     const world = await createWorld()
-    const lower = await lstat(join(world.repo, '.git'))
-    const upper = await lstat(join(world.repo, '.GIT')).catch(() => undefined)
-    // A developer may use a case-sensitive macOS volume even though the platform supports case-insensitive volumes.
-    if (upper?.ino !== lower.ino || upper?.dev !== lower.dev) return
     await world.git(['config', 'core.precomposeUnicode', 'false'])
     await put(join(world.repo, tracked, 'keep.txt'), 'retained\n')
     await world.commit()
+    // Query this pair: a volume can fold ASCII case but keep Unicode normalization forms distinct.
+    const existing = await lstat(join(world.repo, tracked), { bigint: true })
+    const alias = await lstat(join(world.repo, selected), {
+      bigint: true,
+    }).catch(() => undefined)
+    const destination =
+      alias?.ino === existing.ino && alias.dev === existing.dev
+        ? tracked
+        : selected
     await put(join(world.source, selected, 'too.txt'), 'copied\n')
     // Act
     await world.cli(['--repo', world.repo, selected])
     // Assert
-    expect(await readFile(join(world.repo, tracked, 'too.txt'), 'utf8')).toBe(
-      'copied\n',
-    )
+    expect(
+      await readFile(join(world.repo, destination, 'too.txt'), 'utf8'),
+    ).toBe('copied\n')
     expect(
       (
         await world.git(
@@ -427,7 +432,7 @@ test.skipIf(process.platform === 'linux').each([
             '-c',
             'core.precomposeUnicode=false',
             'show',
-            `main:${tracked}/too.txt`,
+            `main:${destination}/too.txt`,
           ],
           world.remote,
         )

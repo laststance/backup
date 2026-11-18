@@ -154,7 +154,10 @@ async function compareCopy(
     ],
     options,
   )
-  expect(actual.exitCode === 0).toBe(expected.exitCode === 0)
+  expect(
+    actual.exitCode === 0,
+    `backup: ${actual.stderr}\ncp: ${expected.stderr}`,
+  ).toBe(expected.exitCode === 0)
   expect(await snapshot(world.repo)).toEqual(await snapshot(reference))
   return expected.exitCode
 }
@@ -231,6 +234,7 @@ test.each(
     ['linked-directory/'],
     ['linked-directory/../choice'],
     ['nested/a/'],
+    ['-draft', 'nested/a/', 'notes'],
   ].map((operands) => ({ operands })),
 )(
   'copies multiple, missing, or link-qualified operands with native cp results ($operands)',

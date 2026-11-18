@@ -9,7 +9,7 @@ import {
   readlink,
   realpath,
 } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
+import { isAbsolute, join, relative, sep } from 'node:path'
 import { prepareOperands, removePayload } from './copy-payload'
 import { recursiveCopy } from './utils/recursive-copy'
 import type { BigIntStats } from 'node:fs'
@@ -28,7 +28,11 @@ import { readNulRecords } from './utils/read-nul-records'
 import { metadataAlias } from './utils/metadata-alias'
 import { parseStageRecord } from './utils/parse-stage-record'
 import type { StageRecord } from './utils/parse-stage-record'
-import { resolveBackupPath } from './utils/resolve-backup-path'
+import {
+  resolveBackupPath,
+  resolveSourcePath,
+} from './utils/resolve-backup-path'
+import { foldCopyPath } from './utils/fold-copy-path'
 
 export type Entry = {
   kind: 'directory' | 'file' | 'symlink' | 'special'
@@ -186,15 +190,7 @@ export async function scanSource(
       )
   )
     throw new Error(`Invalid destination path: ${JSON.stringify(name)}`)
-  // Directory-designating operands follow a leaf symlink. An ordinary leaf symlink is copied verbatim.
-  const directoryOperand =
-    resolved.endsWith('/') ||
-    resolved.endsWith(sep) ||
-    basename(resolved) === '.' ||
-    basename(resolved) === '..'
-  const path = directoryOperand
-    ? await realpath(resolved)
-    : join(await realpath(dirname(resolved)), basename(resolved))
+  const path = await resolveSourcePath(resolved)
   if (
     isWithin(repository.directory, path) ||
     isWithin(path, repository.directory) ||
@@ -452,7 +448,7 @@ export async function validateDestination(
   })
   const fold = (path: string) =>
     upper?.ino === lower.ino && upper?.dev === lower.dev
-      ? path.normalize('NFC').toUpperCase().toLowerCase()
+      ? foldCopyPath(path)
       : path
   const files = new Map<string, Entry>()
   const spellings = new Map<string, string>()
@@ -671,7 +667,7 @@ export async function copySources(
     const alias = await maybeLstat(join(scratch, 'PAYLOAD'))
     const fold = (key: string) =>
       alias?.ino === sample.ino && alias.dev === sample.dev
-        ? key.normalize('NFC').toUpperCase().toLowerCase()
+        ? foldCopyPath(key)
         : key
     for (const [index, source] of prepared.sources.entries()) {
       // Case-sensitive sources can contribute more than one name to a single physical output.
