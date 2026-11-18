@@ -94,10 +94,15 @@ test('installs the npm tarball and recovers exact files and links using Node wit
 
   // Assert
   expect(help.stdout).toContain('Usage: backup')
-  expect(remotePaths.split('\n')).toContain('cooking/too.txt')
-  expect(remotePaths.split('\n')).not.toContain('too.txt')
-  expect(remotePaths.split('\n')).not.toContain('cooking/other.txt')
-  expect(await readFile(join(restored, 'cooking', 'too.txt'), 'utf8')).toBe(
+  expect(remotePaths.trimEnd().split('\n')).toEqual([
+    'notes/.gitattributes',
+    'notes/binary.dat',
+    'notes/crlf.txt',
+    'notes/link',
+    'notes/run.sh',
+    'too.txt',
+  ])
+  expect(await readFile(join(restored, 'too.txt'), 'utf8')).toBe(
     'selected packaged bytes\n',
   )
   expect(reportedVersion.stdout.trim()).toBe(version)

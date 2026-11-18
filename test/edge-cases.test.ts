@@ -8,42 +8,34 @@ import { readNulRecords } from '../src/utils/read-nul-records'
 
 useFixtures()
 
-test.each([
-  ['file', 'directory'],
-  ['file', 'symlink'],
-  ['directory', 'file'],
-  ['directory', 'symlink'],
-  ['symlink', 'file'],
-  ['symlink', 'directory'],
-])(
-  'rejects source %s over destination %s before changing any sibling',
-  async (sourceKind, destinationKind) => {
-    // Arrange
-    const world = await createWorld()
-    await put(join(world.repo, 'notes', 'a.md'), 'preserved\n')
-    await put(join(world.source, 'notes', 'a.md'), 'must not overwrite\n')
-    for (const [root, kind] of [
-      [world.source, sourceKind],
-      [world.repo, destinationKind],
-    ]) {
-      if (!root) throw new Error('Missing fixture root')
-      const path = join(root, 'notes', 'z')
-      if (kind === 'directory') await put(join(path, 'file.md'), 'nested\n')
-      else if (kind === 'symlink') await symlink('../missing', path)
-      else await put(path, 'regular\n')
-    }
-    await world.commit()
+test('shows how to find an ignored file copied before another operand fails', async () => {
+  // Arrange
+  const world = await createWorld()
+  await put(join(world.repo, '.gitignore'), '*.log\n')
+  await world.commit()
+  await put(join(world.source, 'debug.log'), 'partial result\n')
 
-    // Act / Assert
-    await expect(world.cli(['--repo', world.repo, 'notes'])).rejects.toThrow(
-      'entry type conflicts',
-    )
-    expect(await readFile(join(world.repo, 'notes', 'a.md'), 'utf8')).toBe(
-      'preserved\n',
-    )
-    expect((await world.git(['status', '--porcelain'])).stdout).toBe('')
-  },
-)
+  // Act
+  const result = world.cli(['--repo', world.repo, 'debug.log', 'missing'])
+
+  // Assert
+  await expect(result).rejects.toThrow('git status --short --ignored')
+  await expect(result).rejects.toThrow(
+    'If a source is missing, restore it or omit that operand.',
+  )
+  expect((await world.git(['status', '--short', '--ignored'])).stdout).toBe(
+    '!! debug.log\n',
+  )
+  expect(await readFile(join(world.repo, 'debug.log'), 'utf8')).toBe(
+    'partial result\n',
+  )
+  expect((await world.git(['for-each-ref'], world.remote)).stdout).toBe('')
+
+  await world.cli(['debug.log'])
+  expect(
+    (await world.git(['show', 'main:debug.log'], world.remote)).stdout,
+  ).toBe('partial result\n')
+})
 
 test.skipIf(process.platform === 'win32')(
   'reports partial copy failure and succeeds after deliberate repair',
@@ -84,41 +76,6 @@ test.skipIf(process.platform === 'win32')(
       (await world.git(['show', 'main:notes/locked/new.md'], world.remote))
         .stdout,
     ).toBe('copy after repair\n')
-  },
-)
-
-test.skipIf(process.platform === 'win32')(
-  'stops before committing when a file missing from the directory source cannot be deleted',
-  async () => {
-    // Arrange
-    const world = await createWorld()
-    await put(join(world.repo, 'notes', 'a.md'), 'deletable\n')
-    await put(join(world.repo, 'notes', 'locked', 'b.md'), 'undeletable\n')
-    await world.commit()
-    await put(join(world.source, 'notes', 'new.md'), 'new\n')
-    const locked = join(world.repo, 'notes', 'locked')
-    await chmod(locked, 0o500)
-    try {
-      // Act / Assert
-      await expect(world.cli(['--repo', world.repo, 'notes'])).rejects.toThrow(
-        'Could not delete "notes/locked/b.md" from the clone',
-      )
-      expect(await readFile(join(locked, 'b.md'), 'utf8')).toBe(
-        'undeletable\n',
-      )
-      expect(
-        (await world.git(['rev-list', '--count', 'HEAD'])).stdout.trim(),
-      ).toBe('1')
-      expect(
-        (
-          await world
-            .git(['show-ref'], world.remote)
-            .catch(() => ({ stdout: '' }))
-        ).stdout,
-      ).toBe('')
-    } finally {
-      await chmod(locked, 0o755)
-    }
   },
 )
 
@@ -424,7 +381,6 @@ test.skipIf(process.platform === 'win32')(
 )
 
 test.each([
-  ['../cooking/too.txt', 'Use an absolute or home-relative path'],
   ['', 'source path cannot be empty'],
   [process.platform === 'win32' ? 'C:\\' : '/', 'filesystem root'],
   ['cooking/.git/../too.txt', 'Git metadata alias'],
@@ -482,10 +438,8 @@ test.each(['file', 'symlink', 'submodule'])(
       await world.git(['commit', '-m', 'track submodule'])
     }
     // Act / Assert
-    await expect(
-      world.cli(['--repo', world.repo, 'cooking/too.txt']),
-    ).rejects.toThrow(
-      kind === 'submodule' ? 'submodule' : 'entry type conflicts',
+    await expect(world.cli(['--repo', world.repo, 'cooking'])).rejects.toThrow(
+      kind === 'submodule' ? 'submodule' : 'failed during copying',
     )
     expect(
       await lstat(join(world.root, 'outside', 'too.txt')).catch(
@@ -515,7 +469,7 @@ test.each(['--assume-unchanged', '--skip-worktree'])(
     await world.cli(['--repo', world.repo, 'cooking/too.txt'])
     // Assert
     expect(
-      (await world.git(['show', 'main:cooking/too.txt'], world.remote)).stdout,
+      (await world.git(['show', 'main:too.txt'], world.remote)).stdout,
     ).toBe('selected\n')
     expect(
       await readFile(join(world.repo, 'cooking', 'keep.txt'), 'utf8'),
@@ -540,11 +494,7 @@ test.skipIf(process.platform === 'win32')(
     await chmod(locked, 0o500)
     try {
       // Act
-      const result = world.cli([
-        '--repo',
-        world.repo,
-        'cooking/recipes/too.txt',
-      ])
+      const result = world.cli(['--repo', world.repo, 'cooking'])
 
       // Assert
       await expect(result).rejects.toThrow('Backup failed during copying')
@@ -555,10 +505,14 @@ test.skipIf(process.platform === 'win32')(
       expect(await readFile(join(locked, 'keep.txt'), 'utf8')).toBe(
         'retained sibling\n',
       )
-      expect((await world.git(['diff', '--cached', '--name-only'])).stdout).toBe('')
+      expect(
+        (await world.git(['diff', '--cached', '--name-only'])).stdout,
+      ).toBe('')
       expect(
         (
-          await world.git(['show-ref'], world.remote).catch(() => ({ stdout: '' }))
+          await world
+            .git(['show-ref'], world.remote)
+            .catch(() => ({ stdout: '' }))
         ).stdout,
       ).toBe('')
     } finally {

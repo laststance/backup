@@ -21,12 +21,20 @@ import {
 } from './git'
 import type { Repository } from './git'
 import {
-  copySource,
+  copySources,
+  isSourceReadError,
   scanSource,
   stageSource,
-  validateDestination,
 } from './filetree'
+import type { Entry, Source } from './filetree'
+import { resolveBackupPath } from './utils/resolve-backup-path'
 import { writeManifest } from './manifest'
+import {
+  clearPendingModes,
+  recoverPendingModes,
+  restoreCopiedModes,
+  savePendingModes,
+} from './restored-modes'
 
 /** Serializes CLI calls across linked worktrees for {@link backup}, leaving stale locks for explicit recovery.
  * @param repository - Resolved common Git directory shared by worktrees.
@@ -86,23 +94,25 @@ async function validateRegistration(
   repository: Repository,
   config: BackupConfig,
   signal: AbortSignal,
+  recoverModes = false,
 ): Promise<void> {
   if ((await currentBranch(repository, signal)) !== config.branch)
     throw new Error(
       `The checked-out branch changed. Check out ${JSON.stringify(config.branch)} or register again.`,
     )
-  await assertClean(repository, signal)
   await verifyGitHub(repository, signal, config.repositoryId)
+  if (recoverModes) await recoverPendingModes(repository, signal)
+  await assertClean(repository, signal)
 }
 
-/** Registers or backs up one source for the CLI, publishing only a verified commit of exact selected content.
+/** Registers or backs up selected sources for the CLI, publishing only a verified commit of exact selected content.
  * @param options - Explicit destination overrides registration; a missing source registers only.
  * @param signal - Cancellation shared with all filesystem and child-process work.
  * @returns A concise, truthful operation result for CLI output.
- * @example await backup({ source: "foo.md", config }, signal)
+ * @example await backup({ sources: ["foo.md"], config }, signal)
  */
 export async function backup(
-  options: { source?: string; directory?: string; config?: BackupConfig },
+  options: { sources: string[]; directory?: string; config?: BackupConfig },
   signal: AbortSignal,
 ): Promise<string> {
   const directory = options.directory ?? options.config?.directory
@@ -113,14 +123,17 @@ export async function backup(
   const repository = await readRepository(directory, signal)
   const release = await acquireLock(repository)
   let phase = 'validation'
+  const addedRead = new Set<string>()
+  let journaledFiles: ReadonlyMap<string, Entry> | undefined
   let affectedPath = ''
   let failure: Error | undefined
   try {
     let config = options.directory ? undefined : options.config
     if (!config) {
       const branch = await currentBranch(repository, signal)
-      await assertClean(repository, signal)
       const identity = await verifyGitHub(repository, signal)
+      if (options.sources.length) await recoverPendingModes(repository, signal)
+      await assertClean(repository, signal)
       config = {
         version: CONFIG_VERSION,
         directory: repository.directory,
@@ -133,9 +146,14 @@ export async function backup(
         throw new Error(
           'The registered local path changed. Register the intended clone again.',
         )
-      await validateRegistration(repository, config, signal)
+      await validateRegistration(
+        repository,
+        config,
+        signal,
+        options.sources.length > 0,
+      )
     }
-    if (options.source === undefined)
+    if (options.sources.length === 0)
       return `Registered ${config.githubRepository} (${config.branch}) at ${JSON.stringify(config.directory)}.`
 
     // lock -> validate -> fetch/ff -> revalidate -> preflight -> copy -> stage/verify -> commit/verify -> push
@@ -144,17 +162,31 @@ export async function backup(
     await validateRegistration(repository, config, signal)
     const originalHead = await headCommit(repository, signal)
     phase = 'preflight'
-    const source = await scanSource(options.source, repository, signal)
-    // Record IDs proven by this scan even if a later check fails, so the retry rereads only changed entries.
-    // The manifest only saves rereads: a failed write costs the next run a full rehash, never this backup.
-    await writeManifest(source, repository).catch((error: unknown) => {
-      const detail = error instanceof Error ? error.message : String(error)
-      console.warn(
-        `Warning: could not update the backup manifest; the next run rereads every file. ${detail}`,
-      )
-    })
-    const plan = await validateDestination(source, repository, signal)
-    affectedPath = join(repository.directory, source.name)
+    const readErrors: Error[] = []
+    const sources: Source[] = []
+    const names: string[] = []
+    for (const input of options.sources) {
+      const { path, name } = resolveBackupPath(input)
+      names.push(name)
+      let source: Source
+      try {
+        source = await scanSource(path, repository, signal, name, readErrors)
+      } catch (error) {
+        // cp continues with other operands after an ordinary source lookup failure.
+        if (!isSourceReadError(error)) throw error
+        readErrors.push(error)
+        continue
+      }
+      sources.push(source)
+      await writeManifest(source, repository).catch((error: unknown) => {
+        const detail = error instanceof Error ? error.message : String(error)
+        console.warn(
+          `Warning: could not update the backup manifest; the next run rereads every file. ${detail}`,
+        )
+      })
+    }
+    const label = names.join(', ')
+    affectedPath = repository.directory
     if ((await headCommit(repository, signal)) !== originalHead)
       throw new Error(
         'HEAD changed during preflight. Retry when other Git operations have finished.',
@@ -162,9 +194,15 @@ export async function backup(
     await assertClean(repository, signal)
 
     phase = 'copying'
-    await copySource(source, repository, signal)
+    const files = await copySources(
+      sources,
+      repository,
+      signal,
+      readErrors,
+      addedRead,
+    )
     phase = 'staging'
-    const changed = await stageSource(plan, repository, signal)
+    const changed = await stageSource(files, repository, signal)
     if (
       (await headCommit(repository, signal)) !== originalHead ||
       (await currentBranch(repository, signal)) !== config.branch
@@ -176,13 +214,16 @@ export async function backup(
     const expectedTree = gitLine(
       (await git(repository.directory, ['write-tree'], signal)).stdout,
     )
+    await savePendingModes(repository, addedRead, files)
+    journaledFiles = files
     let commit = originalHead
     if (changed) {
       phase = 'committing'
       await git(
         repository.directory,
-        ['commit', '--quiet', '-m', `chore(backup): update ${source.name}`],
+        ['commit', '--quiet', '-F', '-'],
         signal,
+        { input: [`chore(backup): update ${label}\n`] },
       )
       commit = await headCommit(repository, signal)
       if (!commit) throw new Error('Commit did not produce a valid HEAD.')
@@ -210,8 +251,12 @@ export async function backup(
     await validateRegistration(repository, config, signal)
     if ((await headCommit(repository, signal)) !== commit)
       throw new Error('HEAD changed before push. Inspect the branch and retry.')
+    if (addedRead.size) {
+      await restoreCopiedModes(repository, addedRead, files, signal)
+      await clearPendingModes(repository)
+    }
     if (!commit || commit === remoteCommit)
-      return `Unchanged: ${JSON.stringify(source.name)}. Remote is up to date.`
+      return `Unchanged: ${JSON.stringify(label)}. Remote is up to date.`
     phase = 'pushing'
     // Explicit SHA/refspec publishes all pending branch history without inherited mirror/tag/submodule pushes.
     await git(
@@ -229,15 +274,11 @@ export async function backup(
       ],
       signal,
     )
-    const { size } = plan.removals
-    const removed = size
-      ? ` Removed ${size} ${size === 1 ? 'path' : 'paths'} missing from the source.`
-      : ''
-    return `Backed up ${JSON.stringify(source.name)} to ${config.githubRepository} (${config.branch}, ${commit.slice(0, 12)}).${removed} All pending branch commits were pushed.`
+    return `Backed up ${JSON.stringify(label)} to ${config.githubRepository} (${config.branch}, ${commit.slice(0, 12)}). All pending branch commits were pushed.`
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     const recovery = ['copying', 'staging', 'committing'].includes(phase)
-      ? `\nAffected destination: ${JSON.stringify(affectedPath)}. No push was attempted. Inspect git status/diff in ${JSON.stringify(repository.directory)}; repair or commit the changes manually, then retry. No files were rolled back.`
+      ? `\nAffected destination: ${JSON.stringify(affectedPath)}. No push was attempted. Run git status --short --ignored in ${JSON.stringify(repository.directory)} and inspect the selected destinations directly. Review git diff and git diff --cached, then repair or commit the changes manually. Fix the reported error before retrying. If a source is missing, restore it or omit that operand. No files were rolled back.`
       : ['push validation', 'pushing'].includes(phase)
         ? `\nLocal commits are retained in ${JSON.stringify(repository.directory)}. Push completion is unconfirmed. Fix the reported issue and rerun the same command; it fetches first and pushes all remaining commits without duplicating the backup commit.`
         : ''
@@ -246,13 +287,22 @@ export async function backup(
     })
     throw failure
   } finally {
-    try {
-      await release()
-    } catch (error) {
-      // Preserve phase/recovery details on failure; a cleanup-only failure still makes a successful run fail.
-      if (!failure) throw error
-      const detail = error instanceof Error ? error.message : String(error)
-      failure.message += `\nLock cleanup failed: ${detail}`
+    // Attempt both cleanups and retain the original phase and recovery instructions.
+    for (const [label, cleanup] of [
+      [
+        'Copy permission cleanup',
+        () => restoreCopiedModes(repository, addedRead, journaledFiles),
+      ],
+      ['Lock cleanup', release],
+    ] as const) {
+      try {
+        await cleanup()
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        if (failure) failure.message += `\n${label} failed: ${detail}`
+        else failure = new Error(`${label} failed: ${detail}`, { cause: error })
+      }
     }
+    if (failure) throw failure
   }
 }

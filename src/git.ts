@@ -5,6 +5,8 @@ import type { BackupConfig } from './config'
 import { isGitHubName } from './utils/github-name'
 import { resolveLocalPath } from './utils/resolve-local-path'
 import { readNulRecords } from './utils/read-nul-records'
+import { parseStageRecord } from './utils/parse-stage-record'
+import { restoredIndexEntry } from './utils/restored-copy'
 import { runCommand } from './utils/run-command'
 import type { CommandOptions } from './utils/run-command'
 
@@ -151,6 +153,7 @@ export async function assertClean(
   signal: AbortSignal,
 ): Promise<void> {
   let dirty = false
+  const modified = new Set<string>()
   await git(
     repository.directory,
     ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
@@ -158,12 +161,35 @@ export async function assertClean(
     {
       consume: async (output) => {
         for await (const record of readNulRecords(output)) {
-          if (record) dirty = true
+          if (
+            record.startsWith(' M ') &&
+            !dirty &&
+            process.platform !== 'win32'
+          )
+            modified.add(record.slice(3))
+          else if (record) dirty = true
         }
       },
     },
   )
-  if (dirty)
+  if (!dirty && modified.size) {
+    // A file restored without owner-read may look modified to Git after chmod changes its ctime.
+    await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
+      consume: async (output) => {
+        for await (const row of readNulRecords(output)) {
+          const indexed = parseStageRecord(row)
+          if (
+            modified.has(indexed.path) &&
+            indexed.stage === '0' &&
+            (await restoredIndexEntry(repository, indexed.path)) ===
+              `${indexed.mode} ${indexed.oid}`
+          )
+            modified.delete(indexed.path)
+        }
+      },
+    })
+  }
+  if (dirty || modified.size)
     throw new Error(
       'The destination has uncommitted changes. Commit or repair them before running backup.',
     )
@@ -283,7 +309,7 @@ export async function verifyGitHub(
     !('private' in metadata) ||
     metadata.private !== true ||
     // Internal repositories report private:true yet are readable by every enterprise member.
-    (('visibility' in metadata) && metadata.visibility !== 'private')
+    ('visibility' in metadata && metadata.visibility !== 'private')
   ) {
     throw new Error(
       'The destination must be a verified private GitHub repository.',

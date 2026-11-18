@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.5.0.0] - 2026-11-18
+
+- Copy one or more operands into the registered clone with native `cp -R` and publish their combined result in one commit. Nested file operands now use their basename. Use `dir/.` to merge directory contents into the clone root.
+- Retain destination-only files when merging directories. Existing files take the overwrite behavior and permissions of the host's `cp -R`. A failed copy can leave partial local results and stops before commit or push.
+
 ## [0.4.0.0] - 2026-11-10
 
 ### Changed

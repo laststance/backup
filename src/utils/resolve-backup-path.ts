@@ -1,64 +1,104 @@
-import { homedir } from 'node:os'
-import { basename, isAbsolute, parse, relative, resolve, sep } from 'node:path'
-import { isWithin } from './is-within'
+import { lstat, realpath } from 'node:fs/promises'
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  parse,
+  resolve,
+  sep,
+} from 'node:path'
 import { metadataAlias } from './metadata-alias'
 
-/** Maps the selected source to a repository-relative destination before {@link scanSource} canonicalizes its parent.
- * Relative selections retain their invocation-directory hierarchy; absolute selections beneath home retain their home hierarchy.
- * @param input - Source spelling supplied to the CLI, including an optional literal home prefix.
- * @param options - Explicit lexical bases for deterministic callers and tests.
- * @returns Absolute source location and a slash-separated destination root, without resolving symlinks.
- * @throws When input is empty, a filesystem root, metadata, drive-relative, or escapes its relative base.
- * @example resolveBackupPath('cooking/too.txt', { cwd: '/home/user', home: '/home/user' })
+/** Preserves the operand spelling consumed by native cp and identifies its worktree destination for {@link scanSource}.
+ * @param options - Explicit working directory for resolving a relative operand.
+ * @example resolveBackupPath('recipes/cake.txt', { cwd: '/work' }) // { path: '/work/recipes/cake.txt', name: 'cake.txt' }
  */
 export function resolveBackupPath(
   input: string,
-  options: { cwd?: string; home?: string } = {},
+  options: { cwd?: string } = {},
 ): { path: string; name: string } {
   if (!input) throw new Error('The source path cannot be empty.')
-  // A drive-relative Windows path depends on hidden per-drive working directories.
   if (sep === '\\' && /^[a-z]:($|[^\\/])/i.test(input))
     throw new Error(
       `Drive-relative source paths are unsupported: ${JSON.stringify(input)}`,
     )
-  const homeRelative =
-    input === '~' ||
-    input.startsWith('~/') ||
-    (sep === '\\' && input.startsWith('~\\'))
-  const absolute = homeRelative || isAbsolute(input)
-  // Only relative inputs and Windows drive-less rooted paths need a usable invocation directory.
-  const needsWorkingDirectory =
-    !absolute ||
-    (sep === '\\' && !homeRelative && !/^(?:[a-z]:|[\\/]{2})/i.test(input))
-  const cwdInput = needsWorkingDirectory ? (options.cwd ?? process.cwd()) : ''
-  const cwd = needsWorkingDirectory ? resolve(cwdInput) : ''
-  const homeInput = options.home ?? homedir()
-  const home = resolve(homeInput)
-  // Expand the prefix textually so redundant separators cannot replace home with a new absolute root.
-  const expanded = homeRelative ? `${homeInput}${sep}${input.slice(2)}` : input
-  const raw = homeRelative
-    ? expanded
-    : isAbsolute(input)
-      ? input
-      : `${cwdInput}${sep}${input}`
-  // Inspect original components so normalization cannot hide a metadata traversal.
-  for (const component of raw.split(sep === '\\' ? /[\\/]/ : '/')) {
-    if (metadataAlias(component))
-      throw new Error(`Git metadata alias in source: ${JSON.stringify(input)}`)
-  }
-  const path = resolve(cwd, expanded)
-  if (path === parse(path).root)
+
+  const separators = sep === '\\' ? /[\\/]/ : /\//
+  // Keep intermediate symlinks, '..', a final '.', and trailing separators for the OS to interpret.
+  let path = input
+  if (!isAbsolute(path)) path = (options.cwd ?? process.cwd()) + sep + path
+  else if (sep === '\\' && !/^(?:[a-z]:|[\\/]{2})/i.test(path))
+    path =
+      parse(options.cwd ?? process.cwd()).root.replace(/[\\/]+$/, '') + path
+
+  if (path.split(separators).some(metadataAlias))
+    throw new Error(`Git metadata alias in source: ${JSON.stringify(input)}`)
+  const normalized = resolve(path)
+  // A parent traversal can select a different directory after the OS follows an intermediate link.
+  if (
+    !path.split(separators).includes('..') &&
+    normalized === parse(normalized).root
+  )
     throw new Error(
       `The source cannot be a filesystem root: ${JSON.stringify(input)}`,
     )
-  if (!absolute && !isWithin(cwd, path))
+
+  // BSD cp merges directory contents for a trailing slash. GNU cp requires an explicit '/.'.
+  const name =
+    process.platform === 'darwin' && path.endsWith('/') ? '.' : basename(path)
+  if (name === '..')
     throw new Error(
-      `Relative source escapes the working directory: ${JSON.stringify(input)}. Use an absolute or home-relative path instead.`,
+      'The destination cannot be the parent of the registered clone.',
     )
-  const name = absolute
-    ? isWithin(home, path)
-      ? relative(home, path) || basename(path)
-      : basename(path)
-    : relative(cwd, path) || basename(path)
-  return { path, name: name.split(sep).join('/') }
+  return { path, name }
+}
+
+/** Resolves a directory required by a source operand before {@link resolveSourcePath} traverses it.
+ * @throws An ENOTDIR source error when a file is used as a directory.
+ * @example await sourceDirectory('/work/notes')
+ */
+async function sourceDirectory(path: string): Promise<string> {
+  const physical = await realpath(path)
+  if (!(await lstat(physical)).isDirectory())
+    throw Object.assign(new Error(`Not a directory: ${JSON.stringify(path)}`), {
+      code: 'ENOTDIR',
+    })
+  return physical
+}
+
+/** Resolves the parent for the source scan while preserving a plain leaf symlink for recursive copy.
+ * @param operand - An absolute operand with its original dot components and separators.
+ * @example await resolveSourcePath('/work/linked-directory/../choice')
+ */
+export async function resolveSourcePath(operand: string): Promise<string> {
+  const leaf = basename(operand)
+  const directoryOperand =
+    operand.endsWith('/') ||
+    operand.endsWith(sep) ||
+    leaf === '.' ||
+    leaf === '..'
+  let path = operand
+  const root = parse(operand).root
+  const components = operand
+    .slice(root.length)
+    .split(sep === '\\' ? /[\\/]+/ : /\/+/)
+  if (process.platform === 'win32' || components.includes('..')) {
+    // Resolve a link before climbing its parent. Some realpath implementations discard '..' first.
+    path = root
+    for (const component of components) {
+      if (component === '..') path = dirname(await sourceDirectory(path))
+      else if (component === '.') path = await sourceDirectory(path)
+      else if (component) path = join(path, component)
+    }
+  }
+  // Node on Windows also accepts a trailing separator on a regular file, which GNU cp rejects.
+  const physical = directoryOperand
+    ? await sourceDirectory(path)
+    : join(await realpath(dirname(path)), basename(path))
+  if (physical === parse(physical).root)
+    throw new Error(
+      `The source cannot be a filesystem root: ${JSON.stringify(operand)}`,
+    )
+  return physical
 }

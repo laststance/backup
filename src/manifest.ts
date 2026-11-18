@@ -114,8 +114,7 @@ export function settledBlobs(source: Source): Map<string, KnownBlob> {
     BigInt(MANIFEST_RACY_WINDOW_MS) * NANOSECONDS_PER_MILLISECOND
   const knownBlobs = new Map<string, KnownBlob>()
   for (const [path, entry] of source.entries) {
-    if (entry.kind === 'directory' || entry.changedAtNs >= settledBeforeNs)
-      continue
+    if (!entry.oid || entry.changedAtNs >= settledBeforeNs) continue
     knownBlobs.set(path, { signature: entry.signature, oid: entry.oid })
   }
   return knownBlobs

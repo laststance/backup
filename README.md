@@ -1,6 +1,6 @@
 # @laststance/backup
 
-Copy a file or directory into an existing private GitHub clone, commit the change, and push it.
+Copy files and directories into an existing private GitHub clone with `cp -R`, then commit and push the result.
 
 ```sh
 backup foo.md
@@ -36,39 +36,32 @@ Show usage with `backup --help` (`-h`) or the installed version with `backup --v
 
 ## Copy and push behavior
 
-Relative sources preserve their path from the directory where you run the command. Home-relative sources (`~/…`) and absolute sources inside your home preserve their path below your home directory, regardless of where you run the command.
+The registered clone is the destination directory. For example, `backup cooking/too.txt notes` performs the copy corresponding to `cp -R -- cooking/too.txt notes <clone>/` before making one backup commit.
 
-| Input | Destination |
+| Input | Local copy result |
 | --- | --- |
-| `backup cooking/too.txt` | `<clone>/cooking/too.txt` only |
-| `backup ./cooking/too.txt` | `<clone>/cooking/too.txt` only |
-| `backup ~/cooking/too.txt` | `<clone>/cooking/too.txt` only |
-| `backup /home/example/cooking/too.txt` (home is `/home/example`) | `<clone>/cooking/too.txt` only |
-| `backup cooking` | `<clone>/cooking/…`, recursively |
-| `backup cooking/recipes` | `<clone>/cooking/recipes/…`, recursively |
-| `backup /var/tmp/cooking/too.txt` (outside home) | `<clone>/too.txt` |
+| `backup cooking/too.txt` | `<clone>/too.txt` |
+| `backup ~/cooking/too.txt` | `<clone>/too.txt` |
+| `backup cooking/recipes` | `<clone>/recipes/…` |
+| `backup cooking/recipes/.` | The contents of `recipes` merge into `<clone>/` |
+| `backup .` | The current directory's contents merge into `<clone>/` |
+| `backup -- -draft.md a.txt` | `<clone>/-draft.md` and `<clone>/a.txt` |
 
-Missing parent directories are created automatically. Selecting one file does not copy its siblings. An absolute source outside your home keeps the previous basename-only behavior. `backup .` and `backup ~` put the selected directory under its own basename rather than merging it into the clone root. These mapping rules use lexical paths; resolving a source-parent symlink does not rename its destination.
+**Upgrading from 0.4.0.** Selecting a nested file now writes to its basename in the clone. Review existing files with the same basename before the first run. Older copies stored under their original hierarchy remain there. Shells expand an unquoted `~` before invoking the CLI. A quoted `~/file` selects the literal `~` directory in the working directory. Directory backups now retain destination-only entries, including files you have removed from the source.
 
-Relative paths may contain `.` or `..` when normalization stays inside the invocation directory. To select a source outside that directory, use an absolute or home-relative path. Filesystem roots, empty source strings, and ambiguous Windows drive-relative paths such as `C:foo` are rejected. On Windows, native path separators are accepted; a backslash in a POSIX filename remains literal. Use `backup -- -draft.md` for a source beginning with a dash.
-
-**Upgrading from 0.3.0:** a directory backup now deletes tracked files under that directory that the source no longer contains. Deleted files leave the branch tip and stay in earlier commits. Before the first 0.4.0 run, compare `git ls-files -- <directory>` in the clone with the source directory.
-
-**Upgrading from 0.1.1:** nested relative sources and absolute sources inside your home now keep their directory structure. Previously flattened backups outside the selected path remain in place. For example, an old `<clone>/too.txt` remains after a new backup creates `<clone>/cooking/too.txt`. Nothing is moved.
-
-- One source per command. Same-type files at the same destination are overwritten. A directory backup deletes tracked files and symlinks under that directory when the source no longer contains them. A file or symlink backup updates only that path. Tracked paths outside the selection stay. Ignored files that Git does not track also stay. A file whose names are one directory entry on the destination volume stays on disk. The clone records the spelling from the source. Deleting a tracked ignore file does not block the push or a later unchanged backup. The files it hid stay on disk until a later backup selects them. `one/foo.md` and `two/foo.md` have separate destinations.
-- Destination parents must be ordinary directories. A file, symlink, submodule, Git metadata path, or conflicting tracked ancestor stops the backup before payload copying. Parents are checked again while copying; avoid changing the destination concurrently.
-- Files hidden by `.gitignore` are included when selected. Exact `.git` entries at every source depth are excluded; metadata aliases such as `.GIT` reject the operation.
-- Regular file bytes, executable bits where Git tracks filesystem modes, and symlink target text/types are checked against the staged Git blobs before committing. With `core.fileMode=false` (usual on Windows), existing Git executable modes are preserved and new regular files use `100644`. Symlinks are copied without following them. On Windows, creating/restoring symlinks requires Developer Mode or suitable privileges.
-- Git for Windows stores symlink target separators as `/` and restores native `\` separators on checkout. Backup verifies that Git representation on Windows; Unix symlink target text remains literal. Regular file bytes are never normalized.
-- Files over 100 MiB, special files, overlapping source/destination paths, sparse checkouts, selected submodules, submodules inside a selected directory, and file/directory/symlink type conflicts are rejected. Empty directories, timestamps, ownership, extended attributes, and hardlink relationships are not preserved by Git.
-- Git attributes/filters that change bytes, index flags that hide changes to selected or deleted paths, and modifying commit hooks cause a visible failure. The CLI does not rewrite attributes or your Git configuration. Automatic CRLF conversion is disabled for its Git commands.
+- macOS and Linux use the system `/bin/cp -R`. Windows uses GNU `cp.exe` from Git for Windows. Multiple operands are processed together. The host determines the handling of repeated basenames, type conflicts, permissions, timestamps and links. If copying fails, the working tree may contain partial results. The backup stops before staging, committing or pushing.
+- Use `directory/.` to copy its contents on every platform. A trailing slash alone merges contents on macOS. GNU cp keeps the directory name. A plain symlink operand is copied as a link, including a dangling link. A trailing slash on a link to a directory selects the directory.
+- On repeated copies, native cp writes existing files in place with their destination permissions. Committing depends on the resulting bytes, Git executable modes and link targets. An unchanged Git tree produces no duplicate commit.
+- A newly copied file can have POSIX permissions that prevent its owner from reading it. After staging such a file, backup restores its native permissions. Plain `git status` may then report it as modified because Git cannot reread it. On later backups, the CLI recognizes that file only while its filesystem identity, permissions, timestamps, size, and staged Git mode and blob still match its verified copy.
+- Git tracks regular files, the owner's execute bit where supported, and symlink targets. Empty directories, special files such as FIFOs, other permission bits, extended attributes, timestamps, and hardlink relationships are local filesystem state. On Windows, symlinks require Developer Mode or suitable privileges. Git records Windows link separators as `/`. With `core.fileMode=false`, existing indexed modes are retained and new regular files use `100644`.
+- Selected ignored files are included. Exact `.git` entries are excluded at every depth and metadata aliases are rejected. Other Git-specific checks protect the registered clone, linked worktrees, submodules and hidden index changes. Writes through links must stay in the backup payload. A regular file cannot overwrite a named pipe because opening the pipe could leave the backup waiting indefinitely for a reader. Files over 100 MiB, filenames that cannot be decoded as UTF-8, filesystem roots and overlapping source/clone paths are rejected. The CLI prepares the scanned entries in a private temporary directory, verifies their names, types and contents, then runs the native copy into the clone. Allow space for a temporary copy of the selected data. On macOS, the system bsdtar preserves directory metadata, including extended attributes.
+- Git attributes/filters that change bytes, index flags that hide changes to selected paths, and modifying commit hooks cause a visible failure. The CLI does not rewrite attributes or your Git configuration. Automatic CRLF conversion is disabled for its Git commands.
 - Git configuration, hooks, and configured transports are trusted and run with your user privileges. Global/system configuration locations (including `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`) are honored; repository/index/object redirection variables are removed from backup's Git commands.
 - The remote must resolve to one GitHub.com private repository for both fetch and push. Privacy, identity, and **Actions disabled** are checked before copying and again before push. An unverifiable check fails closed.
 - The registered branch is fetched and fast-forwarded before copying. Divergent histories, dirty working trees, detached HEAD, and branch changes stop the operation. No force push is used.
 - **All pending commits on the registered branch are pushed, including manual commits.** An unchanged source still pushes pending history. With no changes and no pending commits, the command reports `Unchanged`.
-- Repeated backups are incremental. Each source scan records its Git blob IDs with every entry's inode, size, mode, mtime, and ctime in `<git-common-dir>/laststance-backup-manifests/`, which is never committed. Deletion does not read those records. Later runs reread only entries whose metadata changed, and files already committed with the same bytes and mode are neither rewritten in the clone nor re-added to the index. As with rsync's quick check, a content change that preserves all of that metadata is not detected. Entries changed within 10 seconds of a scan are always reread, and a missing or corrupt manifest causes a full rehash. A manifest that cannot be written prints a warning without stopping the backup. To force a full rehash, delete that directory.
-- A changed backup uses `chore(backup): update <relative-path>`, such as `chore(backup): update cooking/too.txt`. A repository lock serializes CLI invocations, including linked worktrees. Avoid running other Git commands or changing source/destination files during a backup; the lock does not control other programs.
+- The source scan caches settled Git blob IDs in `<git-common-dir>/laststance-backup-manifests/`. A matching inode, size, mode, mtime and ctime allows the scan to reuse a recorded ID. Recent entries are reread. Copied payloads are checked against the source IDs, and Git's staged bytes and modes are verified before committing.
+- A changed backup uses a commit message such as `chore(backup): update too.txt, notes`. A repository lock serializes invocations, including linked worktrees. Avoid editing source or destination files or running other Git commands during a backup.
 
 ## Recover your files
 
@@ -95,7 +88,7 @@ This last command recovers bytes only; use the checkout procedure for symlinks a
 
 Errors identify the failed phase and exit nonzero. Git/gh commands time out after two minutes. The CLI never reports an unconfirmed push as successful.
 
-If copying, staging, or committing fails, copied files/index changes may remain. The error identifies the affected destination. Inspect `git status` and `git diff`/`git diff --cached` there, then repair or commit deliberately before retrying. Nothing is rolled back. `git restore --staged --worktree -- <path>` restores a deletion that is not yet committed.
+If copying, staging, or committing fails, copied files/index changes may remain. The error identifies the affected destination. In the clone, run `git status --short --ignored` to list untracked and ignored paths. Inspect the selected destinations directly to check their contents. Use `git diff` and `git diff --cached` to review tracked and staged changes. Repair or commit the partial changes and fix the reported error before retrying. For a missing source, restore it or omit that operand if you no longer need it. Nothing is rolled back.
 
 If push fails or its response is lost, local commits remain. Fix authentication, network, branch, or GitHub settings and rerun the same command. It fetches first, recognizes history already accepted by the remote, and pushes remaining commits without creating a duplicate backup commit for unchanged content.
 
