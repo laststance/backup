@@ -6,16 +6,13 @@ import { loadConfig } from './config'
 import { INTERRUPTED_EXIT_CODE, TERMINATED_EXIT_CODE } from './constants'
 import { version } from '../package.json'
 
-const HELP = `Usage: backup [--repo <directory>] <file-or-directory>
+const HELP = `Usage: backup [--repo <directory>] <source> [<source> ...]
 
-Copy one source into an existing private GitHub clone, commit, and push.
-Relative sources retain their path below the current working directory.
-Absolute sources beneath home (including ~/) retain their path below home;
-absolute sources outside home use their basename. Missing parents are created.
-Existing parents must be directories, not files, symlinks, or submodules;
-Git metadata paths and conflicting tracked spellings are rejected.
-A directory source deletes tracked files it no longer contains.
-Paths outside the selected path, including old flattened backups, are kept.
+Copy sources into the registered private clone as with cp -R SOURCE... <clone>/,
+then commit and push. A nested file is copied under its basename. Directories
+merge with existing content. Destination-only files stay in place.
+Use dir/. to copy a directory's contents directly into the clone.
+Symlinks are copied as links. Git metadata is excluded.
 
 Options:
   --repo <directory>  Register an existing private clone (alone: setup only)
@@ -64,8 +61,6 @@ try {
   } else if (values.version) {
     console.log(version)
   } else {
-    if (positionals.length > 1)
-      throw new Error('Pass exactly one file or directory per invocation.')
     let directory = values.repo
     const config = directory ? undefined : await loadConfig()
     if (!directory && !config) {
@@ -88,13 +83,12 @@ try {
         prompt.close()
       }
     }
-    const source = positionals[0]
     console.log(
       await backup(
         {
           ...(directory ? { directory } : {}),
           ...(config ? { config } : {}),
-          ...(source !== undefined ? { source } : {}),
+          sources: positionals,
         },
         controller.signal,
       ),

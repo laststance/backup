@@ -1,23 +1,17 @@
-import { createHash, randomBytes } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { constants, createReadStream } from 'node:fs'
 import {
-  appendFile,
-  copyFile,
-  cp,
-  link,
+  chmod,
+  open,
   lstat,
-  lutimes,
-  mkdir,
+  mkdtemp,
   readdir,
-  readFile,
   readlink,
   realpath,
-  rename,
-  symlink,
-  unlink,
-  utimes,
 } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path'
+import { prepareOperands, removePayload } from './copy-payload'
+import { recursiveCopy } from './utils/recursive-copy'
 import type { BigIntStats } from 'node:fs'
 import type { Repository } from './git'
 import { git } from './git'
@@ -37,7 +31,9 @@ import type { StageRecord } from './utils/parse-stage-record'
 import { resolveBackupPath } from './utils/resolve-backup-path'
 
 export type Entry = {
-  kind: 'directory' | 'file' | 'symlink'
+  kind: 'directory' | 'file' | 'symlink' | 'special'
+  /** The private copy needed owner-read to be inspected, while the original mode lacked it. */
+  privateRead?: boolean
   mode: string
   oid: string
   signature: string
@@ -52,24 +48,6 @@ export type Source = {
   entries: Map<string, Entry>
   /** Wall-clock start of the scan, the reference point for {@link settledBlobs}. */
   scannedAtNs: bigint
-}
-
-const planned: unique symbol = Symbol('Plan')
-
-/** A checked destination that only {@link validateDestination} can create and only {@link stageSource} applies. */
-export type Plan = {
-  readonly source: Source
-  /** Index spellings of tracked blobs and symlinks under a directory selection that the scan no longer contains. */
-  readonly removals: ReadonlySet<string>
-  readonly [planned]: true
-}
-
-function withinDestinationRoot(source: Source, path: string): boolean {
-  return path === source.name || path.startsWith(`${source.name}/`)
-}
-
-function isScanExcluded(component: string): boolean {
-  return component === '.git'
 }
 
 /** Captures metadata for {@link scanSource} to detect replacement or writes while bytes are read.
@@ -88,7 +66,7 @@ function signature(stats: BigIntStats): string {
   ].join(':')
 }
 
-/** Hashes raw entries for {@link scanSource} and {@link copySource}, independently of Git filters.
+/** Hashes raw entries for {@link scanSource} and {@link copySources}, independently of Git filters.
  * @param path - Regular file or symlink, never a followed link.
  * @param stats - Entry metadata observed before reading.
  * @param repository - Supplies Git's object hash algorithm.
@@ -116,8 +94,15 @@ async function readEntry(
       signature: marker,
       changedAtNs,
     }
+  // Never open a FIFO, socket, or device to hash it. Native cp handles the filesystem entry.
   if (!stats.isFile() && !stats.isSymbolicLink())
-    throw new Error(`Unsupported filesystem entry: ${JSON.stringify(path)}`)
+    return {
+      kind: 'special',
+      mode: (stats.mode & 0o170000n).toString(8),
+      oid: '',
+      signature: marker,
+      changedAtNs,
+    }
   if (stats.size > MAX_FILE_SIZE_BYTES)
     throw new Error(`File exceeds 100 MiB: ${JSON.stringify(path)}`)
   const kind: Entry['kind'] = stats.isSymbolicLink() ? 'symlink' : 'file'
@@ -154,6 +139,21 @@ async function readEntry(
   return { kind, mode, oid: hash.digest('hex'), signature: marker, changedAtNs }
 }
 
+/** Identifies source I/O failures for which native cp continues visiting the remaining operands.
+ * @example if (isSourceReadError(error)) readErrors.push(error)
+ */
+export function isSourceReadError(
+  error: unknown,
+): error is NodeJS.ErrnoException {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    ['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'ELOOP', 'EIO', 'ESTALE'].includes(
+      String(error.code),
+    )
+  )
+}
+
 /** Builds the complete source manifest before {@link backup} writes anything, excluding exact .git components.
  * Entries whose metadata matches the persisted manifest from {@link readManifest} reuse its blob IDs instead of rereading bytes.
  * @param input - One source file, directory, or symlink.
@@ -168,6 +168,7 @@ export async function scanSource(
   repository: Repository,
   signal: AbortSignal,
   destinationName?: string,
+  readErrors?: Error[],
 ): Promise<Source> {
   // A pre-approved mapping keeps its location as given; canonical parent aliases are not fresh CLI input.
   const mapping =
@@ -176,8 +177,8 @@ export async function scanSource(
       : { path: input, name: destinationName }
   const resolved = mapping.path
   const name = mapping.name
-  // A pre-approved mapping is kept as given, while still rejecting invalid internal keys.
   if (
+    name !== '.' &&
     name
       .split('/')
       .some(
@@ -185,7 +186,15 @@ export async function scanSource(
       )
   )
     throw new Error(`Invalid destination path: ${JSON.stringify(name)}`)
-  const path = join(await realpath(dirname(resolved)), basename(resolved))
+  // Directory-designating operands follow a leaf symlink. An ordinary leaf symlink is copied verbatim.
+  const directoryOperand =
+    resolved.endsWith('/') ||
+    resolved.endsWith(sep) ||
+    basename(resolved) === '.' ||
+    basename(resolved) === '..'
+  const path = directoryOperand
+    ? await realpath(resolved)
+    : join(await realpath(dirname(resolved)), basename(resolved))
   if (
     isWithin(repository.directory, path) ||
     isWithin(path, repository.directory) ||
@@ -199,11 +208,23 @@ export async function scanSource(
   }
   const scannedAtNs = BigInt(Date.now()) * NANOSECONDS_PER_MILLISECOND
   const knownBlobs = await readManifest(repository, path, name)
-  const entries = await walkSource(path, name, repository, signal, knownBlobs)
-  return { path, name, entries, scannedAtNs }
+  const entries = await walkSource(
+    path,
+    name,
+    repository,
+    signal,
+    knownBlobs,
+    readErrors,
+  )
+  return {
+    path,
+    name,
+    entries,
+    scannedAtNs,
+  }
 }
 
-/** Walks one source tree for {@link scanSource} and the {@link copySource} stability rescan, excluding exact .git components.
+/** Walks one source tree for {@link scanSource} and the {@link copySources} stability rescan, excluding exact .git components.
  * @param path - Canonical source location.
  * @param name - Repository-relative destination root used as the key prefix.
  * @param repository - Supplies Git's object hash algorithm.
@@ -218,6 +239,8 @@ async function walkSource(
   repository: Repository,
   signal: AbortSignal,
   knownBlobs: ReadonlyMap<string, KnownBlob>,
+  readErrors?: Error[],
+  allowed?: (key: string) => boolean,
 ): Promise<Map<string, Entry>> {
   const entries = new Map<string, Entry>()
   const visit = async (
@@ -225,17 +248,31 @@ async function walkSource(
     relativePath: string,
   ): Promise<void> => {
     signal.throwIfAborted()
-    const stats = await lstat(absolutePath, { bigint: true })
-    entries.set(
-      relativePath,
-      await readEntry(
-        absolutePath,
-        stats,
-        repository,
-        signal,
-        knownBlobs.get(relativePath),
-      ),
+    if (allowed && !allowed(relativePath))
+      throw new Error(
+        `Unexpected entry in private copy: ${JSON.stringify(relativePath)}`,
+      )
+    let stats = await lstat(absolutePath, { bigint: true })
+    // A group-readable source can become an owner-unreadable private copy after ownership changes.
+    const privateRead = Boolean(
+      allowed &&
+      process.platform !== 'win32' &&
+      stats.isFile() &&
+      !(stats.mode & 0o400n),
     )
+    if (privateRead) {
+      await chmod(absolutePath, Number(stats.mode & 0o7777n) | 0o400)
+      stats = await lstat(absolutePath, { bigint: true })
+    }
+    const entry = await readEntry(
+      absolutePath,
+      stats,
+      repository,
+      signal,
+      knownBlobs.get(relativePath),
+    )
+    if (privateRead) entry.privateRead = true
+    entries.set(relativePath, entry)
     if (!stats.isDirectory()) return
     // Plain buffer names: each child is lstat-ed by visit, and Bun's buffer Dirents carry no name.
     for (const childBytes of await readdir(absolutePath, {
@@ -246,19 +283,34 @@ async function walkSource(
         ignoreBOM: true,
       }).decode(childBytes)
       // Ordinary .git is excluded; aliases reject the entire operation before any copy.
-      if (isScanExcluded(childName)) continue
+      if (childName === '.git' && !allowed) continue
       if (metadataAlias(childName))
         throw new Error(
           `Git metadata alias in source: ${JSON.stringify(childName)}`,
         )
-      await visit(join(absolutePath, childName), `${relativePath}/${childName}`)
+      await visitReadable(
+        join(absolutePath, childName),
+        relativePath === '.' ? childName : `${relativePath}/${childName}`,
+      )
     }
   }
-  await visit(path, name)
+  // Keep successfully visited siblings in input order when a native read would fail locally.
+  const visitReadable = async (
+    absolute: string,
+    key: string,
+  ): Promise<void> => {
+    try {
+      await visit(absolute, key)
+    } catch (error) {
+      if (!readErrors || !isSourceReadError(error)) throw error
+      readErrors.push(error)
+    }
+  }
+  await visitReadable(path, name)
   return entries
 }
 
-/** Lists the ordered parents needed by {@link validateDestination} and {@link copySource} without selecting siblings.
+/** Lists the ordered parents needed by {@link validateDestination} and {@link copySources} without selecting siblings.
  * @param path - Slash-separated destination key.
  * @returns Ancestors from the clone root toward the selected entry.
  * @example destinationAncestors('cooking/recipes/a.txt') // => ['cooking', 'cooking/recipes']
@@ -270,593 +322,501 @@ function destinationAncestors(path: string): string[] {
     .map((_, index) => components.slice(0, index + 1).join('/'))
 }
 
-/** Checks an existing directory without following a link for destination preflight and copy-time parent rechecks.
- * @param path - Repository-relative directory key.
- * @param repository - Destination root and protected metadata locations.
- * @returns Whether the directory already exists.
- * @throws When the directory aliases metadata, escapes the clone, or is a file or symlink.
- * @example await checkDestinationDirectory('cooking', repository)
+/** Protects the resolved Git administration roots, including separate git dirs inside the worktree.
+ * @example assertPayloadPath(destination, repository, fold)
  */
-async function checkDestinationDirectory(
+function assertPayloadPath(
   path: string,
   repository: Repository,
-): Promise<boolean> {
-  const destination = join(repository.directory, ...path.split('/'))
-  const stats = await maybeLstat(destination)
-  if (!stats) return false
-  // lstat rejects links even when they point back into the clone.
-  if (!stats.isDirectory())
-    throw new Error(
-      `Destination entry type conflicts or parent changed: ${JSON.stringify(path)}`,
-    )
-  const canonical = await realpath(destination)
+  fold: (path: string) => string,
+): void {
   if (
-    !isWithin(repository.directory, canonical) ||
-    [repository.gitDirectory, repository.commonDirectory].some((metadata) =>
-      isWithin(metadata, canonical),
+    [repository.gitDirectory, repository.commonDirectory].some((root) =>
+      isWithin(fold(root), fold(path)),
     )
   )
     throw new Error(
-      `Destination aliases protected metadata or escapes the repository: ${JSON.stringify(path)}`,
+      `Destination escapes the backup or aliases Git metadata: ${JSON.stringify(path)}`,
     )
-  return true
 }
 
-/** Validates the whole destination after fetch and before {@link copySource}, preventing partial conflict writes.
- * A directory selection also collects the tracked paths below it that the scan no longer contains.
- * @param source - Complete source manifest.
- * @param repository - Locked destination working tree.
- * @param signal - CLI cancellation signal.
- * @returns The {@link Plan} for {@link stageSource}, once all selected paths, their parents, and every removal are safe.
- * @throws On any conflict, including a removal that is a submodule, unmerged, or hidden by skip-worktree or assume-unchanged.
- * @example const plan = await validateDestination(source, repository, signal)
+/** Resolves the referent of a destination link, including a missing leaf, before cp may write through it.
+ * @example await destinationReferent('shortcut', repository, incomingLinks, linksInOperand, fold)
  */
-export async function validateDestination(
-  source: Source,
+async function destinationReferent(
+  path: string,
   repository: Repository,
-  signal: AbortSignal,
-): Promise<Plan> {
-  const upperMetadata = await maybeLstat(join(repository.directory, '.GIT'))
-  const lowerMetadata = await lstat(join(repository.directory, '.git'), {
-    bigint: true,
-  })
-  const caseInsensitive =
-    upperMetadata?.ino === lowerMetadata.ino &&
-    upperMetadata?.dev === lowerMetadata.dev
-  const canonicalKey = (path: string) =>
-    caseInsensitive ? path.normalize('NFC').toLowerCase() : path
-  const selected = new Map<string, string>()
-  const required = new Map<string, { path: string; kind: Entry['kind'] }>()
-  const paths = [
-    ...destinationAncestors(source.name).map(
-      (path) => [path, { kind: 'directory' as const }] as const,
-    ),
-    ...source.entries,
-  ]
-  for (const [path, entry] of paths) {
-    signal.throwIfAborted()
-    const key = canonicalKey(path)
-    const collision = required.get(key)
-    if (collision && collision.path !== path)
-      throw new Error(
-        `Source paths collide on this filesystem: ${JSON.stringify(collision.path)}, ${JSON.stringify(path)}`,
-      )
-    required.set(key, { path, kind: entry.kind })
-    if (source.entries.has(path)) selected.set(key, path)
-    // Parent directories are checked before descendants, so lstat never traverses an unchecked ancestor.
-    if (entry.kind === 'directory') {
-      await checkDestinationDirectory(path, repository)
+  incomingLinks: ReadonlyMap<string, string>,
+  linksInOperand: ReadonlySet<string>,
+  fold: (path: string) => string,
+): Promise<string> {
+  const pending = path.split('/')
+  const components: string[] = []
+  let followed = 0
+  const escape = () =>
+    new Error(
+      `Destination entry type conflicts: link escapes the backup or aliases Git metadata: ${JSON.stringify(path)}`,
+    )
+  // Resolve component by component: normalizing '..' before expanding a symlink can select a different file.
+  while (pending.length) {
+    const part = pending.shift()!
+    if (!part || part === '.') continue
+    if (part === '..') {
+      if (!components.pop()) throw escape()
       continue
     }
-    const destination = join(repository.directory, ...path.split('/'))
-    const stats = await maybeLstat(destination)
-    if (!stats) continue
-    if (entry.kind === 'symlink' ? !stats.isSymbolicLink() : !stats.isFile())
+    if (metadataAlias(part)) throw escape()
+    const key = [...components, part].join('/')
+    const target = join(repository.directory, key)
+    assertPayloadPath(target, repository, fold)
+    // cp and readdir can visit siblings in different orders. Both possible link targets must stay isolated.
+    if (linksInOperand.has(fold(key)))
       throw new Error(
-        `Destination entry type conflicts: ${JSON.stringify(path)}. No files were copied.`,
+        `Copy would write through a link replaced within the same source: ${JSON.stringify(key)}`,
       )
-    // Selected leaf symlinks remain valid; copying preserves the link itself.
-    if (!stats.isSymbolicLink()) {
-      const canonical = await realpath(destination)
+    let link = incomingLinks.get(fold(key))
+    if (link === undefined && (await maybeLstat(target))?.isSymbolicLink())
+      link = await readlink(target)
+    if (link === undefined) {
+      components.push(part)
+      continue
+    }
+    if (++followed > 40)
+      throw new Error(`Destination symlink cycle: ${JSON.stringify(path)}`)
+    if (isAbsolute(link)) {
+      const root = repository.directory + sep
+      if (fold(link) === fold(repository.directory)) link = ''
+      else if (fold(link).startsWith(fold(root))) link = link.slice(root.length)
+      else throw escape()
+      components.length = 0
+    }
+    pending.unshift(...link.split(sep === '\\' ? /[\\/]/ : '/'))
+  }
+  return components.join('/')
+}
+
+/** Finds every alias which cp will modify in place, rejecting an inode with links outside the writable payload.
+ * @example await hardlinkNames(stats, repository, signal)
+ */
+async function hardlinkNames(
+  target: BigIntStats,
+  repository: Repository,
+  signal: AbortSignal,
+  fold: (path: string) => string,
+): Promise<string[]> {
+  const aliases: string[] = []
+  const visit = async (directory: string): Promise<void> => {
+    for (const child of await readdir(directory, { withFileTypes: true })) {
+      signal.throwIfAborted()
+      if (metadataAlias(child.name)) continue
+      const absolute = join(directory, child.name)
+      // Excluding administrative roots makes an alias into metadata fail the link-count check.
       if (
-        !isWithin(repository.directory, canonical) ||
-        [repository.gitDirectory, repository.commonDirectory].some((metadata) =>
-          isWithin(metadata, canonical),
+        [repository.gitDirectory, repository.commonDirectory].some((root) =>
+          isWithin(fold(root), fold(absolute)),
         )
       )
-        throw new Error(
-          `Destination aliases protected metadata or escapes the repository: ${JSON.stringify(path)}`,
-        )
+        continue
+      if (child.isDirectory()) await visit(absolute)
+      else if (child.isFile()) {
+        const stats = await lstat(absolute, { bigint: true })
+        if (stats.dev === target.dev && stats.ino === target.ino)
+          aliases.push(
+            relative(repository.directory, absolute).split(sep).join('/'),
+          )
+      }
     }
   }
-  const selectsDirectory =
-    source.entries.get(source.name)?.kind === 'directory'
-  const removals = new Set<string>()
-  await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
+  await visit(repository.directory)
+  if (BigInt(aliases.length) !== target.nlink)
+    throw new Error(
+      `Destination hardlink also points outside the backup payload: ${JSON.stringify(aliases[0])}`,
+    )
+  return aliases
+}
+
+/** Checks Git-specific boundaries for {@link copySources} and identifies the files cp can actually change.
+ * @example const files = await validateDestination([source], repository, signal)
+ */
+export async function validateDestination(
+  sources: readonly Source[],
+  repository: Repository,
+  signal: AbortSignal,
+  addedRead = new Set<string>(),
+): Promise<Map<string, Entry>> {
+  if ((await realpath(repository.directory)) !== repository.directory)
+    throw new Error('Destination parent changed or escaped the repository.')
+  const upper = await maybeLstat(join(repository.directory, '.GIT'))
+  const lower = await lstat(join(repository.directory, '.git'), {
+    bigint: true,
+  })
+  const fold = (path: string) =>
+    upper?.ino === lower.ino && upper?.dev === lower.dev
+      ? path.normalize('NFC').toUpperCase().toLowerCase()
+      : path
+  const files = new Map<string, Entry>()
+  const spellings = new Map<string, string>()
+  // New aliases share a physical leaf on folding volumes, even before Git has indexed a spelling.
+  const setFile = (path: string, entry: Entry) => {
+    let physical = ''
+    for (const component of path.split('/')) {
+      const prefix = physical ? physical + '/' + component : component
+      const key = fold(prefix)
+      physical = spellings.get(key) ?? prefix
+      spellings.set(key, physical)
+    }
+    const firstWrite = !files.has(physical)
+    files.set(physical, entry)
+    if (entry.kind !== 'file') addedRead.delete(physical)
+    return firstWrite ? physical : undefined
+  }
+  const directories = new Set<string>()
+  const incomingLinks = new Map<string, string>()
+  const hardlinks = new Map<string, string[]>()
+  for (const source of sources) {
+    const linksInOperand = new Set<string>()
+    for (const [key, entry] of source.entries) {
+      if (entry.kind === 'symlink') linksInOperand.add(fold(key))
+    }
+    for (const [key, entry] of source.entries) {
+      signal.throwIfAborted()
+      if (key === '.') continue
+      // BSD cp emits a diagnostic and skips sockets. GNU cp recreates their filesystem nodes.
+      if (
+        process.platform === 'darwin' &&
+        entry.kind === 'special' &&
+        entry.mode === '140000'
+      )
+        continue
+      let path = key
+      for (const parent of destinationAncestors(key)) {
+        if (
+          linksInOperand.has(fold(parent)) ||
+          incomingLinks.has(fold(parent)) ||
+          (
+            await maybeLstat(join(repository.directory, parent))
+          )?.isSymbolicLink()
+        ) {
+          const physical = await destinationReferent(
+            parent,
+            repository,
+            incomingLinks,
+            linksInOperand,
+            fold,
+          )
+          path = [physical, key.slice(parent.length + 1)]
+            .filter(Boolean)
+            .join('/')
+        }
+      }
+      const destination = join(repository.directory, path)
+      assertPayloadPath(destination, repository, fold)
+      if (entry.kind === 'directory') {
+        directories.add(path)
+        // Even an empty directory operand must not operate on metadata through a destination alias.
+        if (
+          (await maybeLstat(destination))?.isSymbolicLink() ||
+          incomingLinks.has(fold(path))
+        )
+          await destinationReferent(
+            path,
+            repository,
+            incomingLinks,
+            linksInOperand,
+            fold,
+          )
+        continue
+      }
+      const existing = await maybeLstat(destination)
+      // A regular source writes through a destination link. A source symlink replaces the leaf itself.
+      if (entry.kind === 'symlink') {
+        const suffix = source.name === '.' ? key : relative(source.name, key)
+        incomingLinks.set(fold(path), await readlink(join(source.path, suffix)))
+      }
+      if (
+        entry.kind === 'file' &&
+        (linksInOperand.has(fold(path)) ||
+          incomingLinks.has(fold(path)) ||
+          existing?.isSymbolicLink())
+      )
+        path = await destinationReferent(
+          path,
+          repository,
+          incomingLinks,
+          linksInOperand,
+          fold,
+        )
+      const firstWrite = setFile(path, entry)
+      const target =
+        path === key
+          ? existing
+          : await maybeLstat(join(repository.directory, path))
+      if (firstWrite && entry.privateRead && !target) addedRead.add(firstWrite)
+      if (entry.kind === 'file' && target?.isFile() && target.nlink > 1n) {
+        // Writing this inode also writes every other hardlink. Prove all its names are inside the clone.
+        const id = `${target.dev}:${target.ino}`
+        let aliases = hardlinks.get(id)
+        if (!aliases) {
+          aliases = await hardlinkNames(target, repository, signal, fold)
+          hardlinks.set(id, aliases)
+        }
+        for (const alias of aliases) setFile(alias, entry)
+      }
+    }
+  }
+  const selected = new Set<string>()
+  const trackedSpellings = new Map<string, string>()
+  for (const path of [...directories, ...files.keys()]) {
+    for (const required of [...destinationAncestors(path), path])
+      selected.add(fold(required))
+  }
+  await git(repository.directory, ['ls-files', '-v', '--stage', '-z'], signal, {
     consume: async (output) => {
       for await (const record of readNulRecords(output)) {
-        const { mode, stage, path } = parseStageRecord(record)
-        // Every tracked prefix participates, including parents of unrelated tracked siblings.
+        const { path, mode } = parseStageRecord(record.slice(2))
+        // A submodule or a hidden index change must never be overwritten by a payload copy.
         for (const prefix of [...destinationAncestors(path), path]) {
-          const target = required.get(canonicalKey(prefix))
-          if (!target) continue
+          const key = fold(prefix)
+          if (!selected.has(key)) continue
+          const known = trackedSpellings.get(key)
           if (
-            target.path !== prefix ||
-            (prefix !== path && target.kind !== 'directory') ||
-            (prefix === path &&
-              (mode === '160000' || target.kind === 'directory'))
+            (known && known !== prefix) ||
+            (mode === '160000' && path === prefix)
           )
             throw new Error(
               `Tracked path collision or submodule: ${JSON.stringify(path)}`,
             )
+          trackedSpellings.set(key, prefix)
         }
         if (
-          !selectsDirectory ||
-          !withinDestinationRoot(source, path) ||
-          selected.has(canonicalKey(path)) ||
-          path.split('/').some(isScanExcluded)
-        )
-          continue
-        if (mode === '160000')
-          throw new Error(
-            `Tracked path collision or submodule: ${JSON.stringify(path)}`,
-          )
-        if (stage !== '0')
-          throw new Error(
-            `Tracked path has an unresolved merge conflict: ${JSON.stringify(path)}. Resolve it and retry.`,
-          )
-        removals.add(path)
-      }
-    },
-  })
-  await git(repository.directory, ['ls-files', '-v', '-z'], signal, {
-    consume: async (output) => {
-      for await (const record of readNulRecords(output)) {
-        const path = record.slice(2)
-        // git rm discards a hidden assume-unchanged edit that assertClean cannot see.
-        if (
-          (selected.has(canonicalKey(path)) || removals.has(path)) &&
+          selected.has(fold(path)) &&
           (record[0] === 'S' || record[0] !== record[0]?.toUpperCase())
         )
           throw new Error(
-            `Path to back up or delete has skip-worktree or assume-unchanged set: ${JSON.stringify(path)}. Clear the flag and retry.`,
+            `Selected path has skip-worktree or assume-unchanged set: ${JSON.stringify(path)}`,
           )
       }
     },
   })
-  return { source, removals, [planned]: true }
+  // Reuse Git's existing spelling for a directory or file that the destination volume folds.
+  const mapped = new Map<string, Entry>()
+  for (const [path, entry] of files) {
+    let key = path
+    for (const prefix of [...destinationAncestors(path), path]) {
+      const tracked = trackedSpellings.get(fold(prefix))
+      if (tracked) key = tracked + path.slice(prefix.length)
+    }
+    mapped.set(key, entry)
+  }
+  return mapped
 }
 
-/** Creates and rechecks each destination parent for {@link copySource} without traversing symlinks.
- * @param path - Selected repository-relative destination key.
- * @param repository - Preflighted destination clone.
- * @param signal - CLI cancellation signal.
- * @example await prepareDestinationParents('cooking/recipes/a.txt', repository, signal)
+/** Restores native owner-read permissions after Git has finished reading newly created payload files.
+ * {@link backup} also calls this on failure, before releasing the repository lock.
+ * @example await restoreCopiedModes(repository, addedRead)
  */
-async function prepareDestinationParents(
-  path: string,
+export async function restoreCopiedModes(
   repository: Repository,
-  signal: AbortSignal,
+  addedRead: Set<string>,
 ): Promise<void> {
-  for (const ancestor of destinationAncestors(path)) {
-    signal.throwIfAborted()
-    if (await checkDestinationDirectory(ancestor, repository)) continue
-    // Create one component at a time; recursive mkdir could follow a substituted link.
-    try {
-      await mkdir(join(repository.directory, ...ancestor.split('/')))
-    } catch (error) {
-      if (!(
-        error instanceof Error &&
-        'code' in error &&
-        error.code === 'EEXIST'
-      ))
-        throw error
+  for (const key of addedRead) {
+    const path = join(repository.directory, key)
+    const stats = await maybeLstat(path)
+    if (stats?.isFile() && stats.mode & 0o400n) {
+      const handle = await open(
+        path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      )
+      try {
+        const current = await handle.stat({ bigint: true })
+        if (
+          current.ino !== stats.ino ||
+          current.dev !== stats.dev ||
+          !current.isFile()
+        )
+          throw new Error(
+            `Copied entry changed before restoring permissions: ${JSON.stringify(key)}`,
+          )
+        await handle.chmod(Number(current.mode & 0o7377n))
+      } finally {
+        await handle.close()
+      }
     }
-    await checkDestinationDirectory(ancestor, repository)
+    addedRead.delete(key)
   }
 }
 
-/** Rejects a clone root replaced after preflight, before {@link copySource} reads its index or writes beneath it.
- * @param path - Selected destination key named in the error.
- * @param repository - Clone whose canonical root was resolved at startup.
- * @returns Resolves only while the root path still resolves to itself.
- * @throws When the root became a symlink or now resolves elsewhere.
- * @example await assertCloneRoot('cooking/too.txt', repository)
+/** Copies verified private operands with native cp, then checks the resulting files before staging.
+ * @param readErrors - Ordinary source failures reported after the readable parts have been copied.
+ * @example const files = await copySources([source], repository, signal)
  */
-async function assertCloneRoot(
-  path: string,
+export async function copySources(
+  sources: readonly Source[],
   repository: Repository,
-): Promise<void> {
+  signal: AbortSignal,
+  readErrors: Error[] = [],
+  readableUntilStaged?: Set<string>,
+): Promise<Map<string, Entry>> {
   if ((await realpath(repository.directory)) !== repository.directory)
-    throw new Error(
-      `Destination parent changed or escaped the repository: ${JSON.stringify(path)}`,
-    )
-}
-
-/** Reads the index entries under the selected root so {@link copySource} and {@link stageSource} leave already-backed-up files untouched.
- * @param source - Manifest whose destination root limits the listing.
- * @param repository - Clean, locked destination clone.
- * @param signal - CLI cancellation signal.
- * @returns Unconflicted (stage 0) index records of selected paths, keyed by path.
- * @example (await readIndexedBlobs(source, repository, signal)).get('notes/a.md') // => { mode: '100644', oid: '...', stage: '0', path: 'notes/a.md' }
- */
-async function readIndexedBlobs(
-  source: Source,
-  repository: Repository,
-  signal: AbortSignal,
-): Promise<Map<string, StageRecord>> {
-  const indexedBlobs = new Map<string, StageRecord>()
-  await git(
-    repository.directory,
-    ['ls-files', '--stage', '-z', '--', source.name],
-    signal,
-    {
-      consume: async (output) => {
-        for await (const record of readNulRecords(output)) {
-          const indexed = parseStageRecord(record)
-          if (indexed.stage === '0' && source.entries.has(indexed.path))
-            indexedBlobs.set(indexed.path, indexed)
-        }
-      },
-    },
+    throw new Error('Destination parent changed or escaped the repository.')
+  const scratch = await mkdtemp(
+    join(repository.gitDirectory, 'laststance-backup-payload-'),
   )
-  return indexedBlobs
-}
-
-/** Merge-copies preflighted entries for {@link backup} and proves both source stability and copied bytes.
- * Files and symlinks already staged with the same blob ID and mode are skipped; {@link stageSource} still verifies them.
- * @param source - Manifest checked before the first write.
- * @param repository - Clean, locked repository with validated destination paths.
- * @param signal - CLI cancellation signal.
- * @returns Resolves after the source and copied payload still match the original manifest.
- * @example await copySource(source, repository, signal)
- */
-export async function copySource(
-  source: Source,
-  repository: Repository,
-  signal: AbortSignal,
-): Promise<void> {
-  // Read the index only from the validated clone, never from a directory substituted at its path.
-  await assertCloneRoot(source.name, repository)
-  const indexedBlobs = await readIndexedBlobs(source, repository, signal)
-  for (const [path, entry] of source.entries) {
-    signal.throwIfAborted()
-    // Manifest destinations are not source paths: only the suffix below the selected root belongs to the origin.
-    if (!withinDestinationRoot(source, path))
-      throw new Error(
-        `Source manifest entry is outside its destination root: ${JSON.stringify(path)}`,
+  const addedRead = readableUntilStaged ?? new Set<string>()
+  try {
+    const prepared = await prepareOperands(sources, scratch, signal)
+    const operands: string[] = []
+    const verified: Source[] = []
+    const sample = await lstat(prepared.cwd, { bigint: true })
+    const alias = await maybeLstat(join(scratch, 'PAYLOAD'))
+    const fold = (key: string) =>
+      alias?.ino === sample.ino && alias.dev === sample.dev
+        ? key.normalize('NFC').toUpperCase().toLowerCase()
+        : key
+    for (const [index, source] of prepared.sources.entries()) {
+      // Case-sensitive sources can contribute more than one name to a single physical output.
+      const expected = new Map<string, Entry[]>()
+      for (const [key, entry] of source.entries) {
+        if (process.platform === 'darwin' && entry.mode === '140000') continue
+        const identity = fold(key)
+        const candidates = expected.get(identity) ?? []
+        candidates.push(entry)
+        expected.set(identity, candidates)
+      }
+      if (!expected.size) continue
+      const copied = await walkSource(
+        source.path,
+        source.name,
+        repository,
+        signal,
+        new Map(),
+        readErrors.length ? readErrors : undefined,
+        (key) => expected.has(fold(key)),
       )
-    const indexed = indexedBlobs.get(path)
-    // The clean worktree already holds these exact bytes; skipping writes nothing through a possibly swapped parent.
-    if (indexed?.oid === entry.oid && indexed.mode === entry.mode) continue
-    const suffix =
-      path === source.name ? '' : path.slice(source.name.length + 1)
-    const origin = suffix
-      ? join(source.path, ...suffix.split('/'))
-      : source.path
-    const destination = join(repository.directory, ...path.split('/'))
-    // Validate the clone root before creating missing parents, including when the root itself was replaced.
-    await assertCloneRoot(path, repository)
-    await prepareDestinationParents(path, repository, signal)
-    // Root-level selections have no relative ancestors, so always recheck their canonical parent too.
-    const parent = await realpath(dirname(destination))
-    if (
-      !isWithin(repository.directory, parent) ||
-      [repository.gitDirectory, repository.commonDirectory].some((metadata) =>
-        isWithin(metadata, parent),
-      )
-    ) {
-      throw new Error(
-        `Destination parent changed or escaped the repository: ${JSON.stringify(path)}`,
-      )
+      const seen = new Set<string>()
+      for (const [key, entry] of copied) {
+        const identity = fold(key)
+        if (
+          !expected
+            .get(identity)
+            ?.some(
+              (item) =>
+                item.kind === entry.kind &&
+                item.oid === entry.oid &&
+                (entry.kind !== 'special' || item.mode === entry.mode),
+            )
+        )
+          throw new Error(`Copied content changed: ${JSON.stringify(key)}`)
+        seen.add(identity)
+      }
+      if (seen.size !== expected.size)
+        throw new Error(
+          'Source entries changed during copying. Nothing was pushed.',
+        )
+      verified.push({ ...source, entries: copied })
+      operands.push(prepared.operands[index]!)
     }
-    const existing = await maybeLstat(destination)
-    if (
-      existing &&
-      (entry.kind === 'directory'
-        ? !existing.isDirectory()
-        : entry.kind === 'symlink'
-          ? !existing.isSymbolicLink()
-          : !existing.isFile())
+    // All paths and link texts consumed by destination validation now come from the private tree.
+    const files = await validateDestination(
+      verified,
+      repository,
+      signal,
+      addedRead,
     )
-      throw new Error(
-        `Destination entry type changed before copying: ${JSON.stringify(path)}`,
-      )
-    if (entry.kind === 'directory') {
-      if (!existing) await mkdir(destination)
-      await checkDestinationDirectory(path, repository)
-    } else {
-      // Remove an existing link first: fs.cp otherwise stats dangling link targets on repeated copies.
-      if (entry.kind === 'symlink' && existing) await unlink(destination)
-      // fs.cp unlinks replaced files, preserving external hardlinks; verbatim links retain their target text.
-      await cp(origin, destination, {
-        dereference: false,
-        verbatimSymlinks: true,
-        force: true,
-      })
-      // Git for Windows matches index stat at second granularity, so a same-second rewrite with the same size and creation time looks unchanged and `git add` keeps the stale blob.
-      const bumped = new Date(Date.now() + 2_000)
-      if (entry.kind === 'symlink')
-        await lutimes(destination, bumped, bumped)
-      else await utimes(destination, bumped, bumped)
+    if (operands.length)
+      await recursiveCopy(operands, repository.directory, signal, prepared.cwd)
+    if (readErrors.length)
+      throw new Error(readErrors.map((error) => error.message).join('\n'))
+
+    for (const [key, entry] of files) {
+      const path = join(repository.directory, key)
       const copied = await readEntry(
-        destination,
-        await lstat(destination, { bigint: true }),
+        path,
+        await lstat(path, { bigint: true }),
         repository,
         signal,
       )
       if (
         copied.oid !== entry.oid ||
         copied.kind !== entry.kind ||
-        copied.mode !== entry.mode
+        (entry.kind === 'special' && entry.mode !== copied.mode)
       )
-        throw new Error(`Copied content changed: ${JSON.stringify(path)}`)
+        throw new Error(`Copied content changed: ${JSON.stringify(key)}`)
+      // cp preserves an existing file's permissions. Stage the resulting mode, including the process umask.
+      files.set(key, copied)
     }
-  }
-  // Settled entries with unchanged metadata keep their scanned IDs; recently changed ones are reread.
-  const after = await walkSource(
-    source.path,
-    source.name,
-    repository,
-    signal,
-    settledBlobs(source),
-  )
-  if (after.size !== source.entries.size)
-    throw new Error(
-      'Source entries changed during copying. Nothing was pushed.',
-    )
-  for (const [path, before] of source.entries) {
-    const current = after.get(path)
-    if (
-      !current ||
-      current.signature !== before.signature ||
-      current.oid !== before.oid ||
-      current.kind !== before.kind
-    )
-      throw new Error(
-        `Source changed during copying: ${JSON.stringify(path)}. Nothing was pushed.`,
+    for (const source of sources) {
+      const after = await walkSource(
+        source.path,
+        source.name,
+        repository,
+        signal,
+        settledBlobs(source),
       )
-  }
-}
-
-/**
- * Volumes such as APFS store one entry for some distinct Unicode names. Deleting the old name would delete the file {@link copySource} just wrote under the source name.
- */
-async function classifyRemovals(
-  source: Source,
-  repository: Repository,
-  removals: ReadonlySet<string>,
-  signal: AbortSignal,
-): Promise<{ unlink: string[]; indexOnly: string[]; keptPaths: string[] }> {
-  const keptInodes = new Map<string, string>()
-  for (const [path, entry] of source.entries) {
-    if (entry.kind === 'directory') continue
-    signal.throwIfAborted()
-    const stats = await maybeLstat(
-      join(repository.directory, ...path.split('/')),
-    )
-    if (!stats) continue
-    keptInodes.set(`${stats.dev}:${stats.ino}`, path)
-  }
-  const unlink: string[] = []
-  const indexOnly: string[] = []
-  const keptPaths = new Set<string>()
-  const unlinkedInodes = new Set<string>()
-  for (const path of removals) {
-    signal.throwIfAborted()
-    const stats = await maybeLstat(
-      join(repository.directory, ...path.split('/')),
-    )
-    if (!stats) {
-      unlink.push(path)
-      continue
+      if (after.size !== source.entries.size)
+        throw new Error(
+          'Source entries changed during copying. Nothing was pushed.',
+        )
+      for (const [path, before] of source.entries) {
+        const current = after.get(path)
+        if (
+          !current ||
+          current.signature !== before.signature ||
+          current.oid !== before.oid
+        )
+          throw new Error(
+            `Source changed during copying: ${JSON.stringify(path)}. Nothing was pushed.`,
+          )
+      }
     }
-    const inode = `${stats.dev}:${stats.ino}`
-    const kept = keptInodes.get(inode)
-    if (kept || unlinkedInodes.has(inode)) {
-      indexOnly.push(path)
-      if (kept) keptPaths.add(kept)
-      continue
-    }
-    unlink.push(path)
-    unlinkedInodes.add(inode)
-  }
-  return { unlink, indexOnly, keptPaths: [...keptPaths] }
-}
-
-/**
- * The volume keeps the first spelling it stored for a directory entry, and `git status` stays dirty if the index spelling and the directory entry disagree.
- */
-async function renameDirectoryEntryToSource(
-  repository: Repository,
-  kept: string,
-  signal: AbortSignal,
-): Promise<void> {
-  signal.throwIfAborted()
-  const destination = join(repository.directory, ...kept.split('/'))
-  const stats = await maybeLstat(destination)
-  if (!stats) return
-  const parent = dirname(destination)
-  let catalog: string | undefined
-  for (const name of await readdir(parent)) {
-    const entry = await maybeLstat(join(parent, name))
-    if (entry && entry.dev === stats.dev && entry.ino === stats.ino) {
-      catalog = name
-      break
-    }
-  }
-  if (!catalog || catalog === basename(destination)) return
-  const from = join(parent, catalog)
-  const temporary = join(
-    parent,
-    `.backup-name-${randomBytes(8).toString('hex')}`,
-  )
-  if (stats.isSymbolicLink()) {
-    await symlink(await readlink(from), temporary)
-  } else {
+    return files
+  } finally {
     try {
-      // Some filesystems reject a hard link.
-      await link(from, temporary)
-    } catch {
-      await copyFile(from, temporary)
+      if (!readableUntilStaged) await restoreCopiedModes(repository, addedRead)
+    } finally {
+      await removePayload(scratch)
     }
   }
-  try {
-    await unlink(from)
-  } catch (error) {
-    await unlink(temporary).catch(() => undefined)
-    throw error
-  }
-  try {
-    await rename(temporary, destination)
-  } catch (error) {
-    await rename(temporary, from).catch(() => undefined)
-    throw error
-  }
 }
 
-async function pathsWithStatus(
-  repository: Repository,
-  signal: AbortSignal,
-  kind: 'ignored' | 'untracked',
-): Promise<Set<string>> {
-  const marker = kind === 'ignored' ? '!!' : '??'
-  const paths = new Set<string>()
-  await git(
-    repository.directory,
-    [
-      'status',
-      ...(kind === 'ignored' ? ['--ignored'] : []),
-      '--porcelain=v1',
-      '-z',
-      '--untracked-files=all',
-    ],
-    signal,
-    {
-      consume: async (output) => {
-        for await (const record of readNulRecords(output)) {
-          if (!record.startsWith(`${marker} `)) continue
-          paths.add(record.slice(3))
-        }
-      },
-    },
-  )
-  return paths
-}
-
-async function appendRevealedIgnoresToExclude(
-  repository: Repository,
-  source: Source,
-  ignoredBeforeRemoval: ReadonlySet<string>,
-  signal: AbortSignal,
-): Promise<void> {
-  if (!ignoredBeforeRemoval.size) return
-  const untracked = await pathsWithStatus(repository, signal, 'untracked')
-  const revealed = [...ignoredBeforeRemoval]
-    .filter(
-      (path) =>
-        untracked.has(path) &&
-        !source.entries.has(path) &&
-        withinDestinationRoot(source, path),
-    )
-    .sort()
-  if (!revealed.length) return
-  const patterns: string[] = []
-  for (const path of revealed) {
-    if (path.includes('\n') || path.includes('\0'))
-      throw new Error(
-        `Could not keep ignored ${JSON.stringify(path)} on disk after its ignore rule left the source. Nothing was pushed.`,
-      )
-    let escaped = ''
-    for (const character of path)
-      escaped += ' \\*?[]'.includes(character) ? `\\${character}` : character
-    patterns.push(`/${escaped}`)
-  }
-  const excludePath = join(repository.gitDirectory, 'info', 'exclude')
-  await mkdir(dirname(excludePath), { recursive: true })
-  let existing = ''
-  try {
-    existing = await readFile(excludePath, 'utf8')
-  } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT'))
-      throw error
-  }
-  const present = new Set(existing.split('\n'))
-  const additions = patterns.filter((pattern) => !present.has(pattern))
-  if (!additions.length) return
-  const prefix = existing.length === 0 || existing.endsWith('\n') ? '' : '\n'
-  await appendFile(excludePath, `${prefix}${additions.join('\n')}\n`)
-}
-
-/** Deletes a {@link Plan}'s removals, streams exact selected paths into Git, and checks staged blob IDs/types for {@link backup} before commit.
+/** Streams exact selected paths into Git and checks staged blob IDs/types for {@link backup} before commit.
  * Paths already staged with the expected blob ID and mode are not re-added, but every selected path is still verified.
- * @param plan - Original source byte/type manifest and the tracked paths it no longer contains, from {@link validateDestination}.
+ * @param selected - Verified destination bytes and modes returned by {@link copySources}.
  * @param repository - Destination working tree after copying.
  * @param signal - CLI cancellation signal.
- * @returns Whether selected content or deletions differ from HEAD.
- * @throws When a removal survives in the clone or index, or Git stages any other path.
- * @example await stageSource(plan, repository, signal)
+ * @returns Whether selected content differs from HEAD.
+ * @example await stageSource(files, repository, signal)
  */
 export async function stageSource(
-  plan: Plan,
+  selected: Map<string, Entry>,
   repository: Repository,
   signal: AbortSignal,
 ): Promise<boolean> {
-  const { source, removals } = plan
-  let ignoredBeforeRemoval = new Set<string>()
-  if (removals.size) {
-    const checked = new Set<string>()
-    for (const path of removals)
-      for (const ancestor of destinationAncestors(path)) {
-        if (checked.has(ancestor)) continue
-        signal.throwIfAborted()
-        await checkDestinationDirectory(ancestor, repository)
-        checked.add(ancestor)
-      }
-    for (const path of await pathsWithStatus(repository, signal, 'ignored'))
-      if (withinDestinationRoot(source, path)) ignoredBeforeRemoval.add(path)
-    const { unlink, indexOnly, keptPaths } = await classifyRemovals(
-      source,
-      repository,
-      removals,
-      signal,
-    )
-    for (const kept of keptPaths)
-      await renameDirectoryEntryToSource(repository, kept, signal)
-    const removePaths = async (paths: string[], cached: boolean) => {
-      if (!paths.length) return
-      const args = [
-        'rm',
-        '--quiet',
-        '--pathspec-from-file=-',
-        '--pathspec-file-nul',
-      ]
-      if (cached) args.splice(1, 0, '--cached')
-      await git(repository.directory, args, signal, {
-        input: (function* () {
-          for (const path of paths) yield `${path}\0`
-        })(),
-      })
-    }
-    await removePaths(unlink, false)
-    await removePaths(indexOnly, true)
-    // git rm exits 0 after a failed unlink once an earlier path was removed.
-    for (const path of unlink)
-      if (await maybeLstat(join(repository.directory, ...path.split('/'))))
-        throw new Error(
-          `Could not delete ${JSON.stringify(path)} from the clone. Nothing was pushed.`,
-        )
-    for (const kept of keptPaths)
-      if (!(await maybeLstat(join(repository.directory, ...kept.split('/')))))
-        throw new Error(
-          `Could not keep ${JSON.stringify(kept)} while removing its other tracked name. Nothing was pushed.`,
-        )
-  }
   const files = new Map(
-    [...source.entries].filter(([, entry]) => entry.kind !== 'directory'),
+    [...selected].filter(([, entry]) => entry.kind !== 'special'),
   )
+  const special = [...selected].filter(([, entry]) => entry.kind === 'special')
+  if (special.length) {
+    // If cp replaced a tracked file with a special node, remove only the obsolete Git blob.
+    await git(
+      repository.directory,
+      ['update-index', '--force-remove', '-z', '--stdin'],
+      signal,
+      {
+        input: special.map(([path]) => path + '\0'),
+      },
+    )
+  }
   if (files.size) {
-    const indexedBlobs = await readIndexedBlobs(source, repository, signal)
+    const indexedBlobs = new Map<string, StageRecord>()
+    await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
+      consume: async (output) => {
+        for await (const record of readNulRecords(output)) {
+          const indexed = parseStageRecord(record)
+          if (files.has(indexed.path)) indexedBlobs.set(indexed.path, indexed)
+        }
+      },
+    })
     const fileMode = await git(
       repository.directory,
       ['config', '--bool', '--default', 'true', 'core.fileMode'],
@@ -883,17 +843,29 @@ export async function stageSource(
         return indexed?.oid !== entry.oid || indexed.mode !== entry.mode
       })
       .map(([path]) => path)
-    if (unstagedPaths.length)
+    // --renormalize forces Git to reread tracked bytes even on a coarse Windows stat tick.
+    for (const tracked of [false, true]) {
+      const paths = unstagedPaths.filter(
+        (path) => indexedBlobs.has(path) === tracked,
+      )
+      if (!paths.length) continue
       await git(
         repository.directory,
-        ['add', '--force', '--pathspec-from-file=-', '--pathspec-file-nul'],
+        [
+          'add',
+          '--force',
+          ...(tracked ? ['--renormalize'] : []),
+          '--pathspec-from-file=-',
+          '--pathspec-file-nul',
+        ],
         signal,
         {
           input: (function* () {
-            for (const path of unstagedPaths) yield `${path}\0`
+            for (const path of paths) yield `${path}\0`
           })(),
         },
       )
+    }
   }
   let matched = 0
   await git(repository.directory, ['ls-files', '--stage', '-z'], signal, {
@@ -901,16 +873,7 @@ export async function stageSource(
       for await (const record of readNulRecords(output)) {
         const { mode, oid, stage, path } = parseStageRecord(record)
         const entry = files.get(path)
-        if (!entry) {
-          if (
-            withinDestinationRoot(source, path) &&
-            !path.split('/').some(isScanExcluded)
-          )
-            throw new Error(
-              `Git still tracks a path the source no longer contains: ${JSON.stringify(path)}. Nothing was pushed.`,
-            )
-          continue
-        }
+        if (!entry) continue
         if (mode !== entry.mode || oid !== entry.oid || stage !== '0') {
           throw new Error(
             `Git changed the selected bytes or entry type: ${JSON.stringify(path)}. Inspect .gitattributes, filters, and index flags; nothing was pushed.`,
@@ -925,7 +888,6 @@ export async function stageSource(
       'Git did not stage every selected file. Nothing was pushed.',
     )
   let changed = false
-  let deleted = 0
   await git(
     repository.directory,
     ['diff', '--cached', '--name-only', '--no-renames', '-z'],
@@ -933,8 +895,7 @@ export async function stageSource(
     {
       consume: async (output) => {
         for await (const path of readNulRecords(output)) {
-          if (removals.has(path)) deleted++
-          else if (!files.has(path))
+          if (!selected.has(path))
             throw new Error(
               `Unselected staged change detected: ${JSON.stringify(path)}. Nothing was pushed.`,
             )
@@ -942,14 +903,6 @@ export async function stageSource(
         }
       },
     },
-  )
-  if (deleted !== removals.size)
-    throw new Error('Git did not stage every deletion. Nothing was pushed.')
-  await appendRevealedIgnoresToExclude(
-    repository,
-    source,
-    ignoredBeforeRemoval,
-    signal,
   )
   return changed
 }

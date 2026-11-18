@@ -14,7 +14,7 @@ export type CommandOptions = {
   input?: Iterable<string | Uint8Array> | AsyncIterable<string | Uint8Array>
   consume?: (output: Readable) => Promise<void>
   allowFailure?: boolean
-  timeoutMs?: number
+  timeoutMs?: number | null
 }
 
 /** Executes Git/gh for {@link git} and {@link verifyGitHub}, with bounded diagnostics and streamed input/output.
@@ -83,13 +83,16 @@ export async function runCommand(
     stop()
   }
   options.signal?.addEventListener('abort', abort, { once: true })
-  const timeout = setTimeout(() => {
-    failure = new Error(
-      `${command} timed out. Check authentication/network access and retry.`,
-    )
-    stop()
-  }, options.timeoutMs ?? COMMAND_TIMEOUT_MS)
-  timeout.unref()
+  const timeout =
+    options.timeoutMs === null
+      ? undefined
+      : setTimeout(() => {
+          failure = new Error(
+            `${command} timed out. Check authentication/network access and retry.`,
+          )
+          stop()
+        }, options.timeoutMs ?? COMMAND_TIMEOUT_MS)
+  timeout?.unref()
 
   const completion = new Promise<number>((resolve) => {
     child.once('error', (error) => {
@@ -147,7 +150,7 @@ export async function runCommand(
       )
     }
     if (exitCode === 0 && inputResult instanceof Error) throw inputResult
-    return { exitCode, stdout: output }
+    return { exitCode, stdout: output, stderr: diagnostic.toString('utf8') }
   } finally {
     clearTimeout(timeout)
     options.signal?.removeEventListener('abort', abort)

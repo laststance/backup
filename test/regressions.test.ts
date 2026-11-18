@@ -258,23 +258,24 @@ test('accepts the exact 100 MiB boundary during whole-source preflight', async (
 })
 
 test.skipIf(process.platform === 'win32')(
-  'rejects a FIFO without blocking or copying earlier entries',
+  'recreates a FIFO without opening it and publishes its regular sibling',
   async () => {
     // Arrange
     const world = await createWorld()
     await put(join(world.source, 'notes', 'a.md'), 'selected\n')
     await runCommand('mkfifo', [join(world.source, 'notes', 'pipe')])
-    // Act / Assert
-    await expect(world.cli(['--repo', world.repo, 'notes'])).rejects.toThrow(
-      'Unsupported filesystem entry',
-    )
+    // Act
+    await world.cli(['--repo', world.repo, 'notes'])
+    // Assert
+    expect((await lstat(join(world.repo, 'notes', 'pipe'))).isFIFO()).toBe(true)
     expect(
-      await lstat(join(world.repo, 'notes')).catch(() => undefined),
-    ).toBeUndefined()
+      (await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote))
+        .stdout,
+    ).toBe('notes/a.md\n')
   },
 )
 
-test('preserves two same-basename files beneath their respective selected directories', async () => {
+test('overwrites a previously backed-up basename selected from another directory', async () => {
   // Arrange
   const world = await createWorld()
   await put(join(world.source, 'one', 'foo.md'), 'first\n')
@@ -284,13 +285,13 @@ test('preserves two same-basename files beneath their respective selected direct
   await world.cli(['two/foo.md'])
   // Assert
   expect(
-    (await world.git(['show', 'main:one/foo.md'], world.remote)).stdout,
+    (await world.git(['show', 'main~1:foo.md'], world.remote)).stdout,
   ).toBe('first\n')
+  expect((await world.git(['show', 'main:foo.md'], world.remote)).stdout).toBe(
+    'second\n',
+  )
   expect(
-    (await world.git(['show', 'main:two/foo.md'], world.remote)).stdout,
-  ).toBe('second\n')
-  expect(
-    await lstat(join(world.repo, 'foo.md')).catch(() => undefined),
+    await lstat(join(world.repo, 'two')).catch(() => undefined),
   ).toBeUndefined()
   expect(
     (

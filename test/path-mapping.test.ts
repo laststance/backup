@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test'
+import { sep } from 'node:path'
 import { resolveBackupPath } from '../src/utils/resolve-backup-path'
 
 const windows = process.platform === 'win32'
@@ -8,79 +9,45 @@ const cwd = windows
   : '/home/example/workspace'
 
 test.each([
-  ['cooking/too.txt', 'cooking/too.txt'],
-  ['./cooking/too.txt', 'cooking/too.txt'],
-  ['cooking/recipes/', 'cooking/recipes'],
-  ['cooking//./recipes/../too.txt', 'cooking/too.txt'],
-  ['cooking/ お茶 .txt ', 'cooking/ お茶 .txt '],
-  ['-drafts/-recipe.txt', '-drafts/-recipe.txt'],
-  ['~other/too.txt', '~other/too.txt'],
-  ['.', 'workspace'],
-  ['cooking/..', 'workspace'],
-])('preserves the selected relative hierarchy for %j', (input, expected) => {
+  ['cooking/too.txt', 'too.txt'],
+  ['./cooking/too.txt', 'too.txt'],
+  ['cooking/recipes/', process.platform === 'darwin' ? '.' : 'recipes'],
+  ['cooking//./recipes/../too.txt', 'too.txt'],
+  ['cooking/ お茶 .txt ', ' お茶 .txt '],
+  ['-drafts/-recipe.txt', '-recipe.txt'],
+  ['~other/too.txt', 'too.txt'],
+  ['.', '.'],
+  ['../too.txt', 'too.txt'],
+])(
+  'maps the operand %j into the registered directory as cp does',
+  (input, expected) => {
+    // Arrange / Act
+    const result = resolveBackupPath(input, { cwd })
+    // Assert
+    expect(result.name).toBe(expected)
+  },
+)
+
+test.each(['~', '~/cooking/too.txt', '~//cooking/too.txt'])(
+  'passes a quoted tilde to the filesystem literally (%j)',
+  (input) => {
+    // Arrange / Act
+    const result = resolveBackupPath(input, { cwd })
+    // Assert
+    expect(result.path).toBe(cwd + sep + input)
+    expect(result.name).toBe(input === '~' ? '~' : 'too.txt')
+  },
+)
+
+test.each([
+  home + sep + 'too.txt',
+  windows ? 'C:\\temp\\too.txt' : '/var/tmp/too.txt',
+])('places an absolute file in the clone by basename (%j)', (input) => {
   // Arrange / Act
-  const result = resolveBackupPath(input, { cwd, home })
+  const result = resolveBackupPath(input, { cwd })
   // Assert
-  expect(result.name).toBe(expected)
+  expect(result).toEqual({ path: input, name: 'too.txt' })
 })
-
-test.each([
-  '~/cooking/too.txt',
-  '~//cooking/too.txt',
-  ...(windows ? ['~\\cooking/too.txt', '~\\\\cooking/too.txt'] : []),
-  windows
-    ? 'C:\\Users\\example\\cooking\\too.txt'
-    : '/home/example/cooking/too.txt',
-])(
-  'places a home-contained source beneath cooking independently of the working directory (%j)',
-  (input) => {
-    // Arrange / Act
-    const result = resolveBackupPath(input, { cwd, home })
-    // Assert
-    expect(result).toEqual({
-      path: windows
-        ? 'C:\\Users\\example\\cooking\\too.txt'
-        : '/home/example/cooking/too.txt',
-      name: 'cooking/too.txt',
-    })
-  },
-)
-
-test.each(['~', '~/', home])(
-  'preserves the selected home root basename for %j',
-  (input) => {
-    // Arrange / Act
-    const result = resolveBackupPath(input, { cwd, home })
-    // Assert
-    expect(result).toEqual({ path: home, name: 'example' })
-  },
-)
-
-test.each([
-  windows ? 'C:\\temp\\cooking\\too.txt' : '/var/tmp/cooking/too.txt',
-  windows
-    ? 'C:\\Users\\example-other\\cooking\\too.txt'
-    : '/home/example-other/cooking/too.txt',
-  '~/../example-other/cooking/too.txt',
-])(
-  'uses the basename for absolute sources outside the home boundary (%j)',
-  (input) => {
-    // Arrange / Act
-    const result = resolveBackupPath(input, { cwd, home })
-    // Assert
-    expect(result.name).toBe('too.txt')
-  },
-)
-
-test.each(['../too.txt', 'cooking/../../too.txt'])(
-  'rejects a relative escape before choosing a backup path (%j)',
-  (input) => {
-    // Arrange / Act / Assert
-    expect(() => resolveBackupPath(input, { cwd, home })).toThrow(
-      'Use an absolute or home-relative path instead',
-    )
-  },
-)
 
 test.each([
   '.git/../too.txt',
@@ -90,7 +57,7 @@ test.each([
   'rejects a metadata component even when normalization removes it (%j)',
   (input) => {
     // Arrange / Act / Assert
-    expect(() => resolveBackupPath(input, { cwd, home })).toThrow(
+    expect(() => resolveBackupPath(input, { cwd })).toThrow(
       'Git metadata alias',
     )
   },
@@ -98,9 +65,9 @@ test.each([
 
 test('rejects a metadata component in the invocation prefix before normalization', () => {
   // Arrange / Act / Assert
-  expect(() =>
-    resolveBackupPath('too.txt', { cwd: `${cwd}/.git/..`, home }),
-  ).toThrow('Git metadata alias')
+  expect(() => resolveBackupPath('too.txt', { cwd: `${cwd}/.git/..` })).toThrow(
+    'Git metadata alias',
+  )
 })
 
 test.each([
@@ -108,16 +75,16 @@ test.each([
   [windows ? 'C:\\' : '/', 'filesystem root'],
 ])('rejects an invalid source %j before copying', (input, message) => {
   // Arrange / Act / Assert
-  expect(() => resolveBackupPath(input, { cwd, home })).toThrow(message)
+  expect(() => resolveBackupPath(input, { cwd })).toThrow(message)
 })
 
 test.skipIf(windows)('retains literal backslashes in POSIX filenames', () => {
   // Arrange / Act
-  const result = resolveBackupPath('cooking/a\\b.txt', { cwd, home })
+  const result = resolveBackupPath('cooking/a\\b.txt', { cwd })
   // Assert
   expect(result).toEqual({
     path: '/home/example/workspace/cooking/a\\b.txt',
-    name: 'cooking/a\\b.txt',
+    name: 'a\\b.txt',
   })
 })
 
@@ -125,39 +92,36 @@ test.skipIf(!windows).each(['C:foo', 'C:', 'D:folder\\foo'])(
   'rejects ambiguous Windows drive-relative source %j',
   (input) => {
     // Arrange / Act / Assert
-    expect(() => resolveBackupPath(input, { cwd, home })).toThrow(
-      'Drive-relative',
-    )
+    expect(() => resolveBackupPath(input, { cwd })).toThrow('Drive-relative')
   },
 )
 
 test.skipIf(!windows)(
-  'parses native drive paths and UNC shares using their home boundary',
+  'parses native drive paths and UNC shares by basename',
   () => {
     // Arrange / Act / Assert
     expect(
-      resolveBackupPath('C:\\Users\\example\\cooking\\too.txt', { cwd, home }),
+      resolveBackupPath('C:\\Users\\example\\cooking\\too.txt', { cwd }),
     ).toEqual({
       path: 'C:\\Users\\example\\cooking\\too.txt',
-      name: 'cooking/too.txt',
+      name: 'too.txt',
     })
     expect(
       resolveBackupPath('\\\\server\\share\\cooking\\too.txt', {
         cwd,
-        home: '\\\\server\\share',
       }),
     ).toEqual({
       path: '\\\\server\\share\\cooking\\too.txt',
-      name: 'cooking/too.txt',
+      name: 'too.txt',
     })
-    expect(() =>
-      resolveBackupPath('\\\\server\\share\\', { cwd, home }),
-    ).toThrow('filesystem root')
+    expect(() => resolveBackupPath('\\\\server\\share\\', { cwd })).toThrow(
+      'filesystem root',
+    )
     expect(
-      resolveBackupPath('\\Users\\example\\cooking\\too.txt', { cwd, home }),
+      resolveBackupPath('\\Users\\example\\cooking\\too.txt', { cwd }),
     ).toEqual({
       path: 'C:\\Users\\example\\cooking\\too.txt',
-      name: 'cooking/too.txt',
+      name: 'too.txt',
     })
   },
 )
@@ -166,7 +130,7 @@ test.skipIf(windows)(
   'preserves a literal POSIX filename beginning with tilde and backslash',
   () => {
     // Arrange / Act
-    const result = resolveBackupPath('~\\notes.txt', { cwd, home })
+    const result = resolveBackupPath('~\\notes.txt', { cwd })
     // Assert
     expect(result).toEqual({
       path: '/home/example/workspace/~\\notes.txt',

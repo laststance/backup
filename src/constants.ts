@@ -5,7 +5,8 @@ export const COMMAND_TIMEOUT_MS = 120_000
 export const COMMAND_KILL_GRACE_MS = 1_000
 export const PRIVATE_DIRECTORY_MODE = 0o700
 export const PRIVATE_FILE_MODE = 0o600
-export const EXECUTABLE_MODE_MASK = 0o111
+// Git records only the owner's execute bit for a regular file.
+export const EXECUTABLE_MODE_MASK = 0o100
 export const MIN_GIT_MAJOR_VERSION = 2
 export const MIN_GIT_MINOR_VERSION = 31
 export const INTERRUPTED_EXIT_CODE = 130

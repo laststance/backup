@@ -5,18 +5,13 @@ import {
   mkdir,
   readdir,
   readFile,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
-import {
-  createWorld,
-  nodePath,
-  projectRoot,
-  put,
-  useFixtures,
-} from './helpers'
-import { copySource, scanSource, validateDestination } from '../src/filetree'
+import { createWorld, nodePath, projectRoot, put, useFixtures } from './helpers'
+import { copySources, scanSource, validateDestination } from '../src/filetree'
 import { readManifest, writeManifest } from '../src/manifest'
 import { readRepository } from '../src/git'
 import { writePrivateFileAtomically } from '../src/utils/write-private-file-atomically'
@@ -58,12 +53,14 @@ test('lists every nested entry when a source directory is scanned in-process', a
   ])
 })
 
-test('rewrites only changed files when a directory is backed up again', async () => {
+test('overwrites existing files in place even when one file has unchanged bytes', async () => {
   // Arrange
   const world = await createWorld()
   await put(join(world.source, 'notes', 'kept.md'), 'kept\n')
   await put(join(world.source, 'notes', 'edited.md'), 'before\n')
   await world.cli(['--repo', world.repo, 'notes'])
+  // Move the old mtime away from the current filesystem tick so a skipped write is observable.
+  await utimes(join(world.repo, 'notes', 'kept.md'), 1, 1)
   const keptBefore = await lstat(join(world.repo, 'notes', 'kept.md'), {
     bigint: true,
   })
@@ -77,7 +74,7 @@ test('rewrites only changed files when a directory is backed up again', async ()
     bigint: true,
   })
   expect(keptAfter.ino).toBe(keptBefore.ino)
-  expect(keptAfter.mtimeNs).toBe(keptBefore.mtimeNs)
+  expect(keptAfter.mtimeNs).toBeGreaterThan(keptBefore.mtimeNs)
   expect(
     (await world.git(['show', 'main:notes/edited.md'], world.remote)).stdout,
   ).toBe('after\n')
@@ -177,9 +174,7 @@ test('trusts the recorded blob ID while a settled file keeps identical metadata'
   const manifest = JSON.parse(
     await readFile(join(manifestDirectory, manifestFile), 'utf8'),
   )
-  manifest.entries = [
-    ['notes/a.md', manifest.entries[0][1], 'f'.repeat(40)],
-  ]
+  manifest.entries = [['notes/a.md', manifest.entries[0][1], 'f'.repeat(40)]]
   await writeFile(
     join(manifestDirectory, manifestFile),
     JSON.stringify(manifest),
@@ -234,9 +229,9 @@ test('leaves files changed within the last 10 seconds out of the manifest', asyn
   await writeManifest(source, repository)
 
   // Assert
-  expect(
-    (await readManifest(repository, source.path, 'notes/a.md')).size,
-  ).toBe(0)
+  expect((await readManifest(repository, source.path, 'notes/a.md')).size).toBe(
+    0,
+  )
 })
 
 test('stops when an already backed-up file changes during copying', async () => {
@@ -248,25 +243,22 @@ test('stops when an already backed-up file changes during copying', async () => 
   const signal = new AbortController().signal
   const repository = await readRepository(world.repo, signal)
   settleFixtureTimestamps()
-  const source = await scanSource(file, repository, signal, 'notes/a.md')
-  await validateDestination(source, repository, signal)
+  const source = await scanSource(file, repository, signal)
+  await validateDestination([source], repository, signal)
   setSystemTime()
   await put(file, 'edited\n')
 
   // Act / Assert
-  await expect(copySource(source, repository, signal)).rejects.toThrow(
-    'Source changed during copying: "notes/a.md"',
+  await expect(copySources([source], repository, signal)).rejects.toThrow(
+    'Copied content changed: "a.md"',
   )
-  expect(await readFile(join(world.repo, 'notes', 'a.md'), 'utf8')).toBe(
-    'stable\n',
-  )
+  expect(await readFile(join(world.repo, 'a.md'), 'utf8')).toBe('stable\n')
 })
 
 // Windows reports no executable bits and Git ignores filesystem modes there (core.fileMode=false).
 test.skipIf(process.platform === 'win32')(
-  'backs up a permission-only change as an executable file',
+  'retains the existing destination mode when only source permissions change',
   async () => {
-    // Value: protects=chmod +x on unchanged bytes reaches the remote as mode 100755; fails_when=copy/stage skip compares only blob IDs; why_new=no test changes mode alone after a backup; seam=none; no_claim=core.fileMode=false handling
     // Arrange
     const world = await createWorld()
     const file = join(world.source, 'run.sh')
@@ -278,10 +270,10 @@ test.skipIf(process.platform === 'win32')(
     const result = await world.cli(['run.sh'])
 
     // Assert
-    expect(result.stdout).toContain('Backed up "run.sh"')
+    expect(result.stdout).toContain('Unchanged: "run.sh"')
     expect(
       (await world.git(['ls-tree', 'main', 'run.sh'], world.remote)).stdout,
-    ).toStartWith('100755 blob ')
+    ).toStartWith('100644 blob ')
   },
 )
 
