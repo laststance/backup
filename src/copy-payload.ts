@@ -107,25 +107,25 @@ async function prepareDirectory(
       signal,
     )
   if (process.platform === 'darwin') {
-    // Only directory headers travel through bsdtar. Native cp handles every file, link and special node.
+    // bsdtar can stop reading at the end marker before a writer finishes sending padding through a pipe.
+    // Finish the directory-only archive in private storage before opening it for extraction.
+    const archive = join(scratch, 'directory-headers.tar')
     await runCommand(
       '/usr/bin/tar',
-      ['-cf', '-', '--no-recursion', '--null', '-T', '-'],
+      ['-cf', archive, '--no-recursion', '--null', '-T', '-'],
       {
         cwd: source.path,
         input: directories.map((name) => `./${name}\0`),
         signal,
         timeoutMs: null,
-        consume: async (archive) => {
-          await runCommand('/usr/bin/tar', ['-xpf', '-', '--no-fflags'], {
-            cwd: payload,
-            input: archive,
-            signal,
-            timeoutMs: null,
-          })
-        },
       },
     )
+    await runCommand('/usr/bin/tar', ['-xpf', archive, '--no-fflags'], {
+      cwd: payload,
+      signal,
+      timeoutMs: null,
+    })
+    await rm(archive)
     return
   }
   // Populate descendants before restoring a parent's read-only mode.
