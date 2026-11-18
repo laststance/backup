@@ -12,6 +12,7 @@ import {
 import { join } from 'node:path'
 import { userInfo } from 'node:os'
 import { text } from 'node:stream/consumers'
+import { readNulRecords } from '../src/utils/read-nul-records'
 import { runCommand } from '../src/utils/run-command'
 import { createWorld, nodePath, projectRoot, put, useFixtures } from './helpers'
 
@@ -25,10 +26,15 @@ const referenceCp =
         '../../../usr/bin/cp.exe',
       )
     : '/bin/cp'
-const referenceEnv =
-  process.platform === 'win32'
-    ? { ...process.env, MSYS: 'winsymlinks:nativestrict' }
-    : process.env
+
+/** Keeps fixture settings while selecting native Windows symlinks for the reference cp.
+ * @example const env = referenceEnv(world.env)
+ */
+function referenceEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return process.platform === 'win32'
+    ? { ...env, MSYS: `${env.MSYS ?? ''} winsymlinks:nativestrict`.trim() }
+    : env
+}
 
 /** Records observable copy results for comparing a clone's payload with the native cp reference.
  * @example await snapshot(reference)
@@ -82,7 +88,7 @@ test('merges a tree exactly like cp, including destination-only entries, permiss
   // Act
   await runCommand(referenceCp, ['-R', '--', 'notes', reference], {
     cwd: world.source,
-    env: referenceEnv,
+    env: referenceEnv(world.env),
   })
   await world.cli(['--repo', world.repo, 'notes'])
 
@@ -116,7 +122,7 @@ test.each([
     // Act
     await runCommand(referenceCp, ['-R', '--', operand, reference], {
       cwd: world.source,
-      env: referenceEnv,
+      env: referenceEnv(world.env),
     })
     await world.cli(['--repo', world.repo, operand])
 
@@ -133,15 +139,11 @@ async function compareCopy(
   reference: string,
   operands: string[],
 ) {
-  const options = {
-    cwd: world.source,
-    env: { ...referenceEnv, ...world.env },
-    allowFailure: true,
-  }
+  const options = { cwd: world.source, env: world.env, allowFailure: true }
   const expected = await runCommand(
     referenceCp,
     ['-R', '--', ...operands, reference],
-    options,
+    { ...options, env: referenceEnv(world.env) },
   )
   const actual = await runCommand(
     nodePath,
@@ -260,6 +262,9 @@ test.each(
     await symlink('nested/a', join(world.source, 'link'))
     await symlink('absent', join(world.source, 'dangling'))
     await symlink('other/box', join(world.source, 'linked-directory'), 'dir')
+    // This inherited MSYS setting must be overridden independently by both cp invocations.
+    if (process.platform === 'win32' && operands.includes('dangling'))
+      world.env.MSYS = `${world.env.MSYS ?? ''} winsymlinks:lnk`.trim()
 
     // Act
     const status = await compareCopy(world, reference, operands)
@@ -519,7 +524,38 @@ test.skipIf(process.platform !== 'darwin')(
   },
 )
 
-test('publishes a large list of short relative operands from a deep directory with the full commit message', async () => {
+/** Compares every committed path, mode and blob against the native copy, including trees larger than the output cap.
+ * @example await expectPublishedTree(world, reference)
+ */
+async function expectPublishedTree(
+  world: Awaited<ReturnType<typeof createWorld>>,
+  reference: string,
+): Promise<void> {
+  // Give the native result its own object database so the expected tree is independent of the backup.
+  await world.git(['init', '-q'], reference)
+  await world.git(
+    ['-c', 'core.autocrlf=false', 'add', '--force', '--all'],
+    reference,
+  )
+  const expectedTree = (
+    await world.git(['write-tree'], reference)
+  ).stdout.trim()
+  const entries = async (directory: string, tree: string) => {
+    const records: string[] = []
+    await runCommand('git', ['-C', directory, 'ls-tree', '-rz', tree], {
+      env: world.env,
+      consume: async (output) => {
+        for await (const record of readNulRecords(output)) records.push(record)
+      },
+    })
+    return records
+  }
+  expect(await entries(world.remote, 'main')).toEqual(
+    await entries(reference, expectedTree),
+  )
+}
+
+test('publishes every file in a large list of short relative operands from a deep directory with the full commit message', async () => {
   // Arrange
   const world = await createWorld()
   const windows = process.platform === 'win32'
@@ -534,12 +570,12 @@ test('publishes a large list of short relative operands from a deep directory wi
     (_, i) => `${String(i).padStart(4, '0')}-${'f'.repeat(windows ? 8 : 220)}`,
   )
   await mkdir(reference)
-  for (const name of names) await put(join(cwd, name), 'payload')
+  for (const name of names) await put(join(cwd, name), `payload for ${name}`)
 
   // Act
   await runCommand(referenceCp, ['-R', '--', ...names, reference], {
     cwd,
-    env: referenceEnv,
+    env: referenceEnv(world.env),
   })
   await runCommand(
     nodePath,
@@ -559,6 +595,7 @@ test('publishes a large list of short relative operands from a deep directory wi
   expect(
     (await readdir(world.repo)).filter((name) => name !== '.git').sort(),
   ).toEqual(names)
+  await expectPublishedTree(world, reference)
   let message = ''
   await runCommand(
     'git',
@@ -615,16 +652,7 @@ test.skipIf(process.platform !== 'darwin')(
 
       // Assert
       expect(status).toBe(0)
-      const entries = (
-        await world.git(['ls-tree', '-r', '--name-only', 'main'], world.remote)
-      ).stdout
-        .trimEnd()
-        .split('\n')
-      for (const path of entries) {
-        expect(
-          (await world.git(['show', 'main:' + path], world.remote)).stdout,
-        ).toBe(await readFile(join(reference, path), 'utf8'))
-      }
+      await expectPublishedTree(world, reference)
       expect(
         await readFile(join(world.repo, 'tree', 'Docs', 'left'), 'utf8'),
       ).toBe('left')
