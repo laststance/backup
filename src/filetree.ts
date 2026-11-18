@@ -11,6 +11,7 @@ import {
 } from 'node:fs/promises'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { prepareOperands, removePayload } from './copy-payload'
+import { restoreCopiedModes } from './restored-modes'
 import { recursiveCopy } from './utils/recursive-copy'
 import type { BigIntStats } from 'node:fs'
 import type { Repository } from './git'
@@ -24,11 +25,7 @@ import { readManifest, settledBlobs } from './manifest'
 import type { KnownBlob } from './manifest'
 import { isWithin } from './utils/is-within'
 import { maybeLstat } from './utils/maybe-lstat'
-import {
-  recordRestoredCopy,
-  restoredIndexEntry,
-  signature,
-} from './utils/restored-copy'
+import { restoredIndexEntry, signature } from './utils/restored-copy'
 import { readNulRecords } from './utils/read-nul-records'
 import { metadataAlias } from './utils/metadata-alias'
 import { parseStageRecord } from './utils/parse-stage-record'
@@ -667,70 +664,6 @@ async function planDestination(
     mapped.set(key, entry)
   }
   return mapped
-}
-
-/** Restores native owner-read permissions after Git has finished reading newly created payload files.
- * {@link backup} also calls this on failure, before releasing the repository lock.
- * @example await restoreCopiedModes(repository, addedRead)
- */
-export async function restoreCopiedModes(
-  repository: Repository,
-  addedRead: Set<string>,
-  verified?: ReadonlyMap<string, Entry>,
-): Promise<void> {
-  for (const key of addedRead) {
-    const path = join(repository.directory, key)
-    const stats = await maybeLstat(path)
-    if (stats?.isFile() && stats.mode & 0o400n) {
-      const handle = await open(
-        path,
-        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-      )
-      try {
-        const current = await handle.stat({ bigint: true })
-        if (
-          current.ino !== stats.ino ||
-          current.dev !== stats.dev ||
-          !current.isFile()
-        )
-          throw new Error(
-            `Copied entry changed before restoring permissions: ${JSON.stringify(key)}`,
-          )
-        await handle.chmod(Number(current.mode & 0o7377n))
-        const entry = verified?.get(key)
-        if (entry) {
-          // The descriptor remains readable after chmod. Bind the final stat to the exact staged bytes.
-          const restored = await handle.stat({ bigint: true })
-          const hash = createHash(repository.objectFormat).update(
-            `blob ${restored.size}\0`,
-          )
-          for await (const chunk of handle.createReadStream({
-            autoClose: false,
-          }))
-            hash.update(chunk)
-          if (
-            entry.signature !== signature(current) ||
-            entry.oid !== hash.digest('hex') ||
-            signature(restored) !==
-              signature(await handle.stat({ bigint: true }))
-          )
-            throw new Error(
-              `Copied entry changed before recording permissions: ${JSON.stringify(key)}`,
-            )
-          await recordRestoredCopy(
-            repository,
-            key,
-            restored,
-            entry.mode,
-            entry.oid,
-          )
-        }
-      } finally {
-        await handle.close()
-      }
-    }
-    addedRead.delete(key)
-  }
 }
 
 /** Copies verified private operands with native cp, then checks the resulting files before staging.

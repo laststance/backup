@@ -23,13 +23,18 @@ import type { Repository } from './git'
 import {
   copySources,
   isSourceReadError,
-  restoreCopiedModes,
   scanSource,
   stageSource,
 } from './filetree'
-import type { Source } from './filetree'
+import type { Entry, Source } from './filetree'
 import { resolveBackupPath } from './utils/resolve-backup-path'
 import { writeManifest } from './manifest'
+import {
+  clearPendingModes,
+  recoverPendingModes,
+  restoreCopiedModes,
+  savePendingModes,
+} from './restored-modes'
 
 /** Serializes CLI calls across linked worktrees for {@link backup}, leaving stale locks for explicit recovery.
  * @param repository - Resolved common Git directory shared by worktrees.
@@ -89,13 +94,15 @@ async function validateRegistration(
   repository: Repository,
   config: BackupConfig,
   signal: AbortSignal,
+  recoverModes = false,
 ): Promise<void> {
   if ((await currentBranch(repository, signal)) !== config.branch)
     throw new Error(
       `The checked-out branch changed. Check out ${JSON.stringify(config.branch)} or register again.`,
     )
-  await assertClean(repository, signal)
   await verifyGitHub(repository, signal, config.repositoryId)
+  if (recoverModes) await recoverPendingModes(repository, signal)
+  await assertClean(repository, signal)
 }
 
 /** Registers or backs up selected sources for the CLI, publishing only a verified commit of exact selected content.
@@ -117,14 +124,16 @@ export async function backup(
   const release = await acquireLock(repository)
   let phase = 'validation'
   const addedRead = new Set<string>()
+  let journaledFiles: ReadonlyMap<string, Entry> | undefined
   let affectedPath = ''
   let failure: Error | undefined
   try {
     let config = options.directory ? undefined : options.config
     if (!config) {
       const branch = await currentBranch(repository, signal)
-      await assertClean(repository, signal)
       const identity = await verifyGitHub(repository, signal)
+      if (options.sources.length) await recoverPendingModes(repository, signal)
+      await assertClean(repository, signal)
       config = {
         version: CONFIG_VERSION,
         directory: repository.directory,
@@ -137,7 +146,12 @@ export async function backup(
         throw new Error(
           'The registered local path changed. Register the intended clone again.',
         )
-      await validateRegistration(repository, config, signal)
+      await validateRegistration(
+        repository,
+        config,
+        signal,
+        options.sources.length > 0,
+      )
     }
     if (options.sources.length === 0)
       return `Registered ${config.githubRepository} (${config.branch}) at ${JSON.stringify(config.directory)}.`
@@ -200,6 +214,8 @@ export async function backup(
     const expectedTree = gitLine(
       (await git(repository.directory, ['write-tree'], signal)).stdout,
     )
+    await savePendingModes(repository, addedRead, files)
+    journaledFiles = files
     let commit = originalHead
     if (changed) {
       phase = 'committing'
@@ -235,7 +251,10 @@ export async function backup(
     await validateRegistration(repository, config, signal)
     if ((await headCommit(repository, signal)) !== commit)
       throw new Error('HEAD changed before push. Inspect the branch and retry.')
-    await restoreCopiedModes(repository, addedRead, files)
+    if (addedRead.size) {
+      await restoreCopiedModes(repository, addedRead, files, signal)
+      await clearPendingModes(repository)
+    }
     if (!commit || commit === remoteCommit)
       return `Unchanged: ${JSON.stringify(label)}. Remote is up to date.`
     phase = 'pushing'
@@ -272,7 +291,7 @@ export async function backup(
     for (const [label, cleanup] of [
       [
         'Copy permission cleanup',
-        () => restoreCopiedModes(repository, addedRead),
+        () => restoreCopiedModes(repository, addedRead, journaledFiles),
       ],
       ['Lock cleanup', release],
     ] as const) {

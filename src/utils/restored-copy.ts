@@ -40,7 +40,7 @@ export async function recordRestoredCopy(
 ): Promise<void> {
   await writePrivateFileAtomically(
     recordPath(repository, path),
-    `${signature(stats)} ${mode} ${oid}`,
+    `2 ${signature(stats)} ${mode} ${oid}`,
   )
 }
 
@@ -56,7 +56,7 @@ export async function restoredIndexEntry(
   const current = stats ?? (await maybeLstat(join(repository.directory, key)))
   if (!current?.isFile() || (current.mode & 0o400n) !== 0n) return
   const path = recordPath(repository, key)
-  const prefix = signature(current) + ' '
+  const prefix = `2 ${signature(current)} `
   const record = await maybeLstat(path)
   // Each record ends with a six-digit Git mode, a space and the repository's hex blob ID.
   const oidLength = repository.objectFormat === 'sha256' ? 64 : 40
@@ -66,5 +66,11 @@ export async function restoredIndexEntry(
   )
     return
   const content = await readFile(path, 'utf8')
-  if (content.startsWith(prefix)) return content.slice(prefix.length)
+  const after = await maybeLstat(join(repository.directory, key))
+  if (
+    content.startsWith(prefix) &&
+    after?.isFile() &&
+    signature(after) === signature(current)
+  )
+    return content.slice(prefix.length)
 }
