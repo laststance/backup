@@ -35,7 +35,11 @@ export function resolveBackupPath(
   if (path.split(separators).some(metadataAlias))
     throw new Error(`Git metadata alias in source: ${JSON.stringify(input)}`)
   const normalized = resolve(path)
-  if (normalized === parse(normalized).root)
+  // A parent traversal can select a different directory after the OS follows an intermediate link.
+  if (
+    !path.split(separators).includes('..') &&
+    normalized === parse(normalized).root
+  )
     throw new Error(
       `The source cannot be a filesystem root: ${JSON.stringify(input)}`,
     )
@@ -86,7 +90,12 @@ export async function resolveSourcePath(operand: string): Promise<string> {
     }
   }
   // Node on Windows also accepts a trailing separator on a regular file, which GNU cp rejects.
-  return directoryOperand
-    ? sourceDirectory(path)
+  const physical = directoryOperand
+    ? await sourceDirectory(path)
     : join(await realpath(dirname(path)), basename(path))
+  if (physical === parse(physical).root)
+    throw new Error(
+      `The source cannot be a filesystem root: ${JSON.stringify(operand)}`,
+    )
+  return physical
 }

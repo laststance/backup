@@ -1,6 +1,11 @@
 import { expect, test } from 'bun:test'
-import { sep } from 'node:path'
-import { resolveBackupPath } from '../src/utils/resolve-backup-path'
+import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, parse, relative, resolve, sep } from 'node:path'
+import {
+  resolveBackupPath,
+  resolveSourcePath,
+} from '../src/utils/resolve-backup-path'
 
 const windows = process.platform === 'win32'
 const home = windows ? 'C:\\Users\\example' : '/home/example'
@@ -96,13 +101,15 @@ test.skipIf(!windows).each(['C:foo', 'C:', 'D:folder\\foo'])(
   },
 )
 
-test.skipIf(!windows).each([
-  '//server/share',
-  '//server/share/',
-  '\\\\server\\share',
-  '\\\\server\\share\\',
-  'C:/',
-])('rejects Windows filesystem roots before scanning (%j)', (input) => {
+test
+  .skipIf(!windows)
+  .each([
+    '//server/share',
+    '//server/share/',
+    '\\\\server\\share',
+    '\\\\server\\share\\',
+    'C:/',
+  ])('rejects Windows filesystem roots before scanning (%j)', (input) => {
   // Arrange / Act / Assert
   expect(() => resolveBackupPath(input, { cwd })).toThrow('filesystem root')
 })
@@ -146,3 +153,34 @@ test.skipIf(windows)(
     })
   },
 )
+
+test('checks the physical directory after symlink and parent traversal select a different root', async () => {
+  // Arrange
+  const fixture = await realpath(
+    await mkdtemp(join(tmpdir(), 'backup-root-test-')),
+  )
+  try {
+    const root = parse(fixture).root
+    const alias = join(fixture, 'alias')
+    const selected = join(fixture, 'selected')
+    const depth = relative(root, alias).split(sep).length
+    const nested = join(selected, ...Array<string>(depth).fill('child'))
+    await mkdir(nested, { recursive: true })
+    await symlink(nested, alias, 'junction')
+    const operand = alias + sep + ('..' + sep).repeat(depth) + '.'
+    const rootLink = join(fixture, 'root-link')
+    await symlink(root, rootLink, 'junction')
+
+    // Act / Assert
+    expect(resolve(operand)).toBe(root)
+    const mapped = resolveBackupPath(operand)
+    expect(mapped.name).toBe('.')
+    expect(await resolveSourcePath(mapped.path)).toBe(selected)
+    await expect(resolveSourcePath(rootLink + sep + '.')).rejects.toThrow(
+      'filesystem root',
+    )
+    expect(await resolveSourcePath(rootLink)).toBe(rootLink)
+  } finally {
+    await rm(fixture, { recursive: true, force: true })
+  }
+})
