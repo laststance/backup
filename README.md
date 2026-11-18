@@ -87,7 +87,7 @@ This last command recovers bytes only; use the checkout procedure for symlinks a
 
 Errors identify the failed phase and exit nonzero. Git/gh commands time out after two minutes. The CLI never reports an unconfirmed push as successful.
 
-If copying, staging, or committing fails, copied files/index changes may remain. The error identifies the affected destination. In the clone, run `git status --short --ignored` to list untracked and ignored paths. Inspect the selected destinations directly to check their contents. Use `git diff` and `git diff --cached` to review tracked and staged changes, then repair or commit deliberately before retrying. Nothing is rolled back.
+If copying, staging, or committing fails, copied files/index changes may remain. The error identifies the affected destination. In the clone, run `git status --short --ignored` to list untracked and ignored paths. Inspect the selected destinations directly to check their contents. Use `git diff` and `git diff --cached` to review tracked and staged changes. Repair or commit the partial changes and fix the reported error before retrying. For a missing source, restore it or omit that operand if you no longer need it. Nothing is rolled back.
 
 If push fails or its response is lost, local commits remain. Fix authentication, network, branch, or GitHub settings and rerun the same command. It fetches first, recognizes history already accepted by the remote, and pushes remaining commits without creating a duplicate backup commit for unchanged content.
 

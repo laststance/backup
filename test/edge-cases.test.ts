@@ -20,6 +20,9 @@ test('shows how to find an ignored file copied before another operand fails', as
 
   // Assert
   await expect(result).rejects.toThrow('git status --short --ignored')
+  await expect(result).rejects.toThrow(
+    'If a source is missing, restore it or omit that operand.',
+  )
   expect((await world.git(['status', '--short', '--ignored'])).stdout).toBe(
     '!! debug.log\n',
   )
@@ -27,6 +30,11 @@ test('shows how to find an ignored file copied before another operand fails', as
     'partial result\n',
   )
   expect((await world.git(['for-each-ref'], world.remote)).stdout).toBe('')
+
+  await world.cli(['debug.log'])
+  expect(
+    (await world.git(['show', 'main:debug.log'], world.remote)).stdout,
+  ).toBe('partial result\n')
 })
 
 test.skipIf(process.platform === 'win32')(
