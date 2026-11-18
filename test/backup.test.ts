@@ -255,9 +255,11 @@ test('rejects a submodule inside the selected directory before copying', async (
   await expect(world.cli(['--repo', world.repo, 'notes'])).rejects.toThrow(
     'submodule',
   )
-  expect(
-    await lstat(join(world.repo, 'notes', 'new.md')).catch(() => undefined),
-  ).toBeUndefined()
+  await expect(
+    lstat(join(world.repo, 'notes', 'vendor', 'new.md')),
+  ).rejects.toMatchObject({
+    code: 'ENOENT',
+  })
 })
 
 test('rejects metadata aliases before writing any selected content', async () => {
